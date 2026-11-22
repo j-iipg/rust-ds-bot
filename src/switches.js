@@ -42,10 +42,13 @@ function uniqueName(base) {
 }
 
 // добавить, если ещё нет; возвращает {device, isNew}
-function add(id, type) {
-  if (devices[id]) return { device: get(id), isNew: false };
+function add(id, type, owner) {
+  if (devices[id]) {
+    if (owner && devices[id].owner !== String(owner)) { devices[id].owner = String(owner); save(); }
+    return { device: get(id), isNew: false };
+  }
   const base = type === TYPE.ALARM ? 'аларм' : type === TYPE.SWITCH ? 'свитч' : 'ящик';
-  devices[id] = { name: uniqueName(base), type };
+  devices[id] = { name: uniqueName(base), type, owner: owner ? String(owner) : undefined };
   save();
   return { device: get(id), isNew: true };
 }

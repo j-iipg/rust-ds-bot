@@ -13,6 +13,38 @@
 
 Пока бот запущен, зайди на новый сервер → Esc → Rust+ → **Pair with server** — бот сам переключится на него (сохраняется в `data/server.json`). У каждого сервера свой список переключателей.
 
+## Аккаунты тиммейтов (чтобы всё работало без тебя)
+
+Каждый тиммейт может добавить свой Rust+ аккаунт — тогда он сам привязывает сервер и переключатели.
+
+1. Тиммейт ставит Node.js и Google Chrome.
+2. В cmd: `npx @liamcottle/rustplus.js fcm-register --config-file rust-account.json` → входит через Steam.
+3. Пишет боту **в личку** `!link` и прикладывает файл `rust-account.json`.
+4. Заходит на сервер → Esc → Rust+ → **Pair with server**, дальше E → Pair на переключателях.
+
+Переключатели, которые привязал тиммейт, работают через его аккаунт. `!accounts` — список и сколько живут токены (~14 дней; за 2 дня бот напомнит). Обновить свой токен на хостинге: на ПК `npm run register` и отправь боту в личку `!link` + `rustplus.config.json`.
+
+## Хостинг (VDS с Ubuntu или Raspberry Pi)
+
+```bash
+# 1. Node.js и git
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs git
+# 2. Бот
+git clone https://github.com/j-iipg/rust-ds-bot.git && cd rust-ds-bot && npm install
+nano .env            # вставь содержимое своего .env с ПК
+# 3. Запуск 24/7 с автозапуском
+sudo npm install -g pm2
+pm2 start src/index.js --name rust-bot
+pm2 save && pm2 startup   # выполни команду, которую он покажет
+```
+
+Потом в Discord отправь боту в личку `!link` + свой `rustplus.config.json` с ПК (Chrome на сервере не нужен) и сделай в игре **Pair with server**.
+
+- Логи: `pm2 logs rust-bot` · перезапуск: `pm2 restart rust-bot`
+- Обновить: `git pull && npm install && pm2 restart rust-bot`
+- На ПК бота выключи, чтобы не работали два одновременно.
+
 ## Переключатели и алармы
 
 1. Бот должен быть запущен. В игре смотри на Smart Switch / Smart Alarm → зажми **E** → **Pair**.
@@ -29,6 +61,8 @@
 | `!del свет` | удалить из списка |
 | `!team` | кто в пачке, онлайн, где стоит, кто лидер |
 | `!leader ник` | передать лидерство (если аккаунт бота — лидер) |
+| `!accounts` | аккаунты и сколько живут токены |
+| `!link` | (в личку боту, с файлом) добавить аккаунт |
 | `!help` | помощь |
 
 Привязывает устройства только аккаунт бота, а управлять могут все: тиммейты — через тим-чат, остальные — через Discord-канал. Список хранится в `data/devices.json`.

@@ -2,7 +2,8 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { createRustClient } = require('./relay');
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
+const accounts = require('./accounts');
 
 const { toGrid } = require('./grid');
 const dev = require('./switches');
@@ -54,7 +55,8 @@ const grid = (x, y) => toGrid(x, y, mapSize);
 
 // ---------- Discord ----------
 const discord = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages],
+  partials: [Partials.Channel], // нужно, чтобы получать личные сообщения (для !link)
 });
 
 async function toDiscord(text, color) {
@@ -172,6 +174,49 @@ async function pollEvents() {
   } catch (e) { log('getMapMarkers error:', e.message || e); }
 }
 
+// ---------- токены аккаунтов на сервере ----------
+// playerToken у каждого аккаунта свой для каждого сервера: data/tokens-<serverId>.json { steamId: token }
+const tokensFile = (sid) => path.join(process.cwd(), 'data', `tokens-${sid}.json`);
+function readTokens(sid) { try { return JSON.parse(fs.readFileSync(tokensFile(sid), 'utf8')); } catch { return {}; } }
+function saveToken(sid, steamId, token) {
+  if (!sid || !steamId || token === undefined) return;
+  const t = readTokens(sid);
+  t[String(steamId)] = String(token);
+  fs.mkdirSync(path.dirname(tokensFile(sid)), { recursive: true });
+  fs.writeFileSync(tokensFile(sid), JSON.stringify(t, null, 2));
+}
+
+// Подключения от имени других аккаунтов (для устройств, которые привязал тиммейт)
+const pool = new Map(); // steamId -> { client, ready }
+function clientFor(steamId) {
+  const primary = String(server.RUST_PLAYER_ID);
+  if (!steamId || String(steamId) === primary || !server.RUST_SERVER_ID) {
+    return rust ? Promise.resolve(rust) : Promise.reject(new Error('бот сейчас не подключён к Rust+'));
+  }
+  steamId = String(steamId);
+  if (pool.has(steamId)) return pool.get(steamId).ready;
+  const token = readTokens(server.RUST_SERVER_ID)[steamId];
+  const auth = accounts.authToken(steamId);
+  const who = accounts.get(steamId)?.name || steamId;
+  if (!token || !auth) return Promise.reject(new Error(`нет данных аккаунта ${who} — пусть сделает Pair with server`));
+  const { client } = createRustClient({ ...server, RUST_PLAYER_ID: steamId, RUST_PLAYER_TOKEN: token }, auth);
+  const ready = new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`аккаунт ${who} не подключился`)), 15000);
+    client.on('connected', () => { clearTimeout(t); resolve(client); });
+  });
+  ready.catch(() => pool.delete(steamId));
+  client.on('error', (e) => log(`Rust+ (${who}) ошибка:`, e.message || e));
+  client.on('message', (m) => { if (m.broadcast?.entityChanged) onEntityChanged(m.broadcast.entityChanged); });
+  client.on('disconnected', () => pool.delete(steamId));
+  pool.set(steamId, { client, ready });
+  client.connect();
+  return ready;
+}
+function closePool() {
+  for (const { client } of pool.values()) { client.switching = true; try { client.disconnect(); } catch {} }
+  pool.clear();
+}
+
 // ---------- переключатели и алармы ----------
 const switchState = new Map(); // entityId -> true/false
 
@@ -185,7 +230,8 @@ const stateText = (v) => (v === true ? 'ВКЛ' : v === false ? 'ВЫКЛ' : '?'
 
 // getEntityInfo заодно подписывает бота на изменения этого устройства
 async function refreshDevice(d) {
-  const res = await rust.sendRequestAsync({ entityId: d.id, getEntityInfo: {} });
+  const c = await clientFor(d.owner);
+  const res = await c.sendRequestAsync({ entityId: d.id, getEntityInfo: {} });
   const v = !!res.entityInfo?.payload?.value;
   if (d.type === dev.TYPE.SWITCH) switchState.set(d.id, v);
   return v;
@@ -199,7 +245,8 @@ async function subscribeAll() {
 }
 
 async function setSwitch(d, value) {
-  await rust.sendRequestAsync({ entityId: d.id, setEntityValue: { value } });
+  const c = await clientFor(d.owner);
+  await c.sendRequestAsync({ entityId: d.id, setEntityValue: { value } });
   switchState.set(d.id, value);
   updatePanel();
 }
@@ -215,28 +262,44 @@ function onEntityChanged(ch) {
 }
 
 // привязка из игры (смотришь на устройство → зажать E → Pair)
-function onPairing(body) {
+function onPairing(body, account) {
+  const who = account?.name || body.playerId;
+  if (body.id && body.playerId && body.playerToken !== undefined) saveToken(body.id, body.playerId, body.playerToken);
+
   if (body.type === 'server') {
-    if (body.id && body.playerToken) switchServer(body);
+    if (!body.id) return;
+    const sameServer = body.id === server.RUST_SERVER_ID;
+    const isPrimary = String(body.playerId) === String(server.RUST_PLAYER_ID);
+    if (!sameServer || (isPrimary && String(body.playerToken) !== String(server.RUST_PLAYER_TOKEN)) || !rust) {
+      switchServer(body, who);
+    } else if (!isPrimary) {
+      toDiscord(`🔗 **${who}** привязал свой аккаунт к этому серверу — теперь может привязывать переключатели`, 0x3498db);
+    }
     return;
   }
   if (body.type !== 'entity' || !body.entityId) return;
+  if (body.id && server.RUST_SERVER_ID && body.id !== server.RUST_SERVER_ID) {
+    toDiscord(`⚠️ ${who} привязал устройство на другом сервере. Сначала сделайте Rust+ → Pair with server на нужном сервере.`);
+    return;
+  }
   const id = Number(body.entityId);
   const type = Number(body.entityType);
   if (type === dev.TYPE.STORAGE) {
     toDiscord('📦 Storage Monitor пока не поддерживается — привязывай Smart Switch или Smart Alarm.');
     return;
   }
-  const { device, isNew } = dev.add(id, type);
-  if (!isNew) return;
+  const { device, isNew } = dev.add(id, type, body.playerId);
+  if (!isNew) { if (rust) refreshDevice(device).catch(() => {}).finally(updatePanel); return; }
   const kind = type === dev.TYPE.ALARM ? 'Smart Alarm' : 'Smart Switch';
-  notify(`🔗 Привязан **${kind}** → имя **${device.name}**\nПереименовать: \`!name ${device.name} новое_имя\``,
+  notify(`🔗 **${who}** привязал **${kind}** → имя **${device.name}**\nПереименовать: \`!name ${device.name} новое_имя\``,
          `[BOT] Привязан ${kind}: ${device.name}. Переименовать: !name ${device.name} имя`, 0x3498db);
   if (rust) refreshDevice(device).catch(() => {}).finally(updatePanel);
   else updatePanel();
 }
 
 const HELP = [
+  '!link — добавить свой аккаунт (файл в ЛС боту), чтобы привязывать без владельца',
+  '!accounts — привязанные аккаунты и сколько дней живут токены',
   '!team — кто в пачке, онлайн и где',
   '!leader <ник> — передать лидерство',
   '!panel — пульт с кнопками в Discord',
@@ -321,6 +384,25 @@ async function runCommand(text, who) {
       }
       await rust.sendRequestAsync({ promoteToLeader: { steamId: target.steamId } });
       return { lines: [`👑 Лидер теперь ${target.name}`], action: `${who}: лидер теперь ${target.name}` };
+    }
+
+    case 'accounts': case 'аккаунты': {
+      const list = accounts.all();
+      if (!list.length) return { lines: ['Нет аккаунтов'] };
+      return { lines: list.map((a) => {
+        const d = accounts.daysLeft(a);
+        const main = String(a.steamId) === String(server.RUST_PLAYER_ID) ? ' ⭐ основной' : '';
+        return `${d <= 2 ? '⚠️' : '👤'} ${a.name} (${a.steamId}) — токен ещё ${d} дн.${main}`;
+      }) };
+    }
+
+    case 'unlink': {
+      const q = args.join(' ').toLowerCase();
+      const a = accounts.all().find((x) => x.steamId === q || x.name.toLowerCase() === q);
+      if (!a) return { lines: ['Не нашёл аккаунт. Список: !accounts'] };
+      stopFcm(a.steamId);
+      accounts.remove(a.steamId);
+      return { lines: [`🗑️ Аккаунт ${a.name} удалён`] };
     }
 
     case 'name': case 'имя': {
@@ -451,6 +533,54 @@ discord.on('interactionCreate', async (i) => {
   updatePanel();
 });
 
+// ---------- аккаунты: FCM и !link ----------
+const fcmClients = new Map(); // steamId -> PushReceiverClient
+function runFcm(acc) {
+  stopFcm(acc.steamId);
+  fcmClients.set(acc.steamId, startFcm(acc, onPairing, log));
+}
+function stopFcm(steamId) {
+  const c = fcmClients.get(steamId);
+  if (c) { try { c.destroy(); } catch {} fcmClients.delete(steamId); }
+}
+
+async function handleLink(m) {
+  const file = m.attachments.first();
+  const inGuild = !!m.guild;
+  if (inGuild) m.delete().catch(() => {}); // файл с ключами — убираем из канала
+  const reply = (text) => (inGuild ? m.channel.send(`<@${m.author.id}> ${text}`) : m.reply(text)).catch(() => {});
+  if (!file) {
+    return reply([
+      'Как добавить свой аккаунт:',
+      '1. Поставь Node.js (nodejs.org) и Google Chrome',
+      '2. В cmd: `npx @liamcottle/rustplus.js fcm-register --config-file rust-account.json`',
+      '3. Войди через Steam в открывшемся Chrome',
+      '4. Пришли мне **в личку** файл `rust-account.json` с текстом `!link`',
+    ].join('\n'));
+  }
+  try {
+    const res = await fetch(file.url);
+    const config = JSON.parse(await res.text());
+    const name = m.member?.displayName || m.author.globalName || m.author.username;
+    const r = accounts.put(config, name);
+    if (r.error) return reply(`⚠️ Не подошёл файл: ${r.error}`);
+    runFcm(r.account);
+    log(`Добавлен аккаунт ${r.account.name} (${r.account.steamId})`);
+    reply(`✅ Аккаунт **${r.account.name}** добавлен, токен живёт ещё ${accounts.daysLeft(r.account)} дн.\n` +
+          'Теперь зайди на сервер → Esc → Rust+ → **Pair with server**. После этого можешь привязывать переключатели (E → Pair).');
+    toDiscord(`👤 **${r.account.name}** ${r.isNew ? 'добавил' : 'обновил'} свой Rust+ аккаунт`, 0x3498db);
+  } catch (e) {
+    reply(`⚠️ Не смог прочитать файл: ${e.message}`);
+  }
+}
+
+function checkExpiry() {
+  for (const a of accounts.all()) {
+    const d = accounts.daysLeft(a);
+    if (d <= 2) toDiscord(`⚠️ Rust+ токен аккаунта **${a.name}** ${d < 0 ? 'истёк' : `истекает через ${d} дн.`} — обнови: \`npm run register\` (или новый файл через \`!link\`)`, 0xe67e22);
+  }
+}
+
 // ---------- мост чата ----------
 async function onTeamMessage(msg) {
   const text = msg.message;
@@ -471,7 +601,14 @@ async function onTeamMessage(msg) {
 }
 
 discord.on('messageCreate', async (m) => {
-  if (m.author.bot || m.channelId !== cfg.channelId || !m.content) return;
+  if (m.author.bot) return;
+  const cmd0 = (m.content || '').trim().split(/\s+/)[0].toLowerCase();
+  if (cmd0 === '!link' && (!m.guild || m.channelId === cfg.channelId)) return handleLink(m);
+  if (!m.guild) {
+    if (m.content) m.reply('В личке я понимаю только `!link` (с файлом аккаунта). Остальные команды — в канале бота.').catch(() => {});
+    return;
+  }
+  if (m.channelId !== cfg.channelId || !m.content) return;
   if (m.content.startsWith('!')) log(`Команда из Discord от ${m.author.username}: ${m.content}`);
   const name = m.member?.displayName || m.author.username;
 
@@ -497,9 +634,7 @@ discord.on('messageCreate', async (m) => {
 // ---------- подключение к Rust+ ----------
 let currentClient = null;
 
-function switchServer(body) {
-  const same = server.RUST_SERVER_ID === body.id && String(server.RUST_PLAYER_TOKEN) === String(body.playerToken);
-  if (same) return;
+function switchServer(body, who) {
   server = {
     RUST_SERVER_ID: body.id,
     RUST_PLAYER_ID: body.playerId,
@@ -510,7 +645,7 @@ function switchServer(body) {
   };
   fs.mkdirSync(path.dirname(SERVER_FILE), { recursive: true });
   fs.writeFileSync(SERVER_FILE, JSON.stringify(server, null, 2));
-  toDiscord(`🔄 Привязан сервер **${body.name}** — переключаюсь на него...`, 0x3498db);
+  toDiscord(`🔄 ${who ? `**${who}** привязал` : 'Привязан'} сервер **${body.name}** — переключаюсь на него...`, 0x3498db);
   log(`Переключаюсь на сервер ${body.name} (${body.id})`);
 
   // отключаемся от старого сервера и сразу подключаемся к новому
@@ -520,6 +655,7 @@ function switchServer(body) {
   markers = null;
   team = new Map();
   switchState.clear();
+  closePool();
   if (currentClient) {
     currentClient.switching = true;
     try { currentClient.disconnect(); } catch {}
@@ -535,7 +671,7 @@ function connectRust() {
   dev.setServer(server.RUST_SERVER_ID || `${server.RUST_IP}_${server.RUST_PORT}`);
   let r, label;
   try {
-    ({ client: r, label } = createRustClient(server));
+    ({ client: r, label } = createRustClient(server, accounts.authToken(server.RUST_PLAYER_ID)));
   } catch (e) {
     log(e.message);
     toDiscord(`⚠️ ${e.message}`);
@@ -580,6 +716,7 @@ function connectRust() {
     log('Rust+ отключён');
     rust = null;
     markers = null;
+    closePool();
     updatePanel();
     timers.forEach(clearInterval);
     timers = [];
@@ -597,8 +734,12 @@ discord.once('clientReady', async () => {
     console.error('Не нашёл канал DISCORD_CHANNEL_ID — проверь ID и что бот добавлен на сервер');
     process.exit(1);
   }
+  accounts.load();
+  for (const a of accounts.all()) runFcm(a);
+  if (!accounts.all().length) log('Нет ни одного Rust+ аккаунта — выполни npm run register');
   connectRust();
-  startFcm(onPairing, log);
+  checkExpiry();
+  setInterval(checkExpiry, 12 * 3600 * 1000);
 });
 
 process.on('unhandledRejection', (e) => log('unhandledRejection:', e?.stack || e?.message || e));

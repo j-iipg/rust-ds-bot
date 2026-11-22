@@ -86,9 +86,9 @@ class RelayRustPlus extends RustPlus {
 }
 
 // Создаёт клиент: через relay, если задан RUST_SERVER_ID, иначе напрямую по ip:port
-function createRustClient(env) {
+function createRustClient(env, authToken) {
   if (env.RUST_SERVER_ID) {
-    const auth = loadAuthToken();
+    const auth = authToken || loadAuthToken();
     if (!auth) throw new Error('Нет Rust+ токена: выполни npm run register (создаст rustplus.config.json)');
     return { client: new RelayRustPlus(env.RUST_SERVER_ID, auth, env.RUST_PLAYER_ID, env.RUST_PLAYER_TOKEN), label: `relay ${env.RUST_SERVER_ID}` };
   }
