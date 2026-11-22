@@ -2,6 +2,8 @@ require('dotenv').config();
 const { createRustClient } = require('./relay');
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const { toGrid } = require('./grid');
+const dev = require('./switches');
+const { startFcm } = require('./fcm');
 
 // ---------- конфиг ----------
 const cfg = {
@@ -154,19 +156,176 @@ async function pollEvents() {
   } catch (e) { log('getMapMarkers error:', e.message || e); }
 }
 
+// ---------- переключатели и алармы ----------
+const switchState = new Map(); // entityId -> true/false
+
+const errText = (e) => {
+  const s = e?.error || e?.message || String(e);
+  if (s === 'not_found') return 'не найден (сломан или отвязан?)';
+  if (s === 'rate_limit') return 'слишком часто, подожди пару секунд';
+  return s;
+};
+const stateText = (v) => (v === true ? 'ВКЛ' : v === false ? 'ВЫКЛ' : '?');
+
+// getEntityInfo заодно подписывает бота на изменения этого устройства
+async function refreshDevice(d) {
+  const res = await rust.sendRequestAsync({ entityId: d.id, getEntityInfo: {} });
+  const v = !!res.entityInfo?.payload?.value;
+  if (d.type === dev.TYPE.SWITCH) switchState.set(d.id, v);
+  return v;
+}
+
+async function subscribeAll() {
+  for (const d of dev.all()) {
+    try { await refreshDevice(d); } catch (e) { log(`Устройство ${d.name}: ${errText(e)}`); }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
+async function setSwitch(d, value) {
+  await rust.sendRequestAsync({ entityId: d.id, setEntityValue: { value } });
+  switchState.set(d.id, value);
+}
+
+function onEntityChanged(ch) {
+  const d = dev.get(ch.entityId);
+  if (!d) return;
+  const v = !!ch.payload?.value;
+  if (d.type === dev.TYPE.SWITCH) switchState.set(d.id, v);
+  if (d.type === dev.TYPE.ALARM && v) {
+    notify(`🚨 **Сработал аларм «${d.name}»!**`, `[BOT] !!! Сработал аларм ${d.name} !!!`, 0xff0000);
+  }
+}
+
+// привязка из игры (смотришь на устройство → зажать E → Pair)
+function onPairing(body) {
+  if (body.type === 'server') {
+    log(`Пришла привязка сервера: ${body.name} (id ${body.id})`);
+    return;
+  }
+  if (body.type !== 'entity' || !body.entityId) return;
+  const id = Number(body.entityId);
+  const type = Number(body.entityType);
+  if (type === dev.TYPE.STORAGE) {
+    toDiscord('📦 Storage Monitor пока не поддерживается — привязывай Smart Switch или Smart Alarm.');
+    return;
+  }
+  const { device, isNew } = dev.add(id, type);
+  if (!isNew) return;
+  const kind = type === dev.TYPE.ALARM ? 'Smart Alarm' : 'Smart Switch';
+  notify(`🔗 Привязан **${kind}** → имя **${device.name}**\nПереименовать: \`!name ${device.name} новое_имя\``,
+         `[BOT] Привязан ${kind}: ${device.name}. Переименовать: !name ${device.name} имя`, 0x3498db);
+  if (rust) refreshDevice(device).catch(() => {});
+}
+
+const HELP = [
+  '!sw — список переключателей и алармов',
+  '!on <имя> / !off <имя> — включить / выключить (можно all)',
+  '!t <имя> — переключить',
+  '!name <старое> <новое> — переименовать',
+  '!del <имя> — удалить из списка',
+];
+
+// Выполняет команду. Возвращает { lines: [...], action: 'короткая строка для тим-чата' } или null, если это не команда.
+async function runCommand(text, who) {
+  const [rawCmd, ...args] = text.slice(1).trim().split(/\s+/);
+  const cmd = (rawCmd || '').toLowerCase();
+  const needRust = () => { if (!rust) throw new Error('бот сейчас не подключён к Rust+'); };
+
+  switch (cmd) {
+    case 'help': case 'помощь': case 'команды':
+      return { lines: HELP };
+
+    case 'sw': case 'свитчи': case 'switches': {
+      needRust();
+      const list = dev.all().filter((d) => d.type !== dev.TYPE.STORAGE);
+      if (!list.length) return { lines: ['Нет привязанных устройств. В игре: смотри на Smart Switch → зажми E → Pair'] };
+      const lines = [];
+      for (const d of list) {
+        try {
+          const v = await refreshDevice(d);
+          lines.push(d.type === dev.TYPE.ALARM ? `🚨 ${d.name}: аларм` : `${v ? '🟢' : '🔴'} ${d.name}: ${stateText(v)}`);
+        } catch (e) { lines.push(`⚠️ ${d.name}: ${errText(e)}`); }
+      }
+      return { lines };
+    }
+
+    case 'on': case 'вкл': case 'off': case 'выкл': case 't': case 'toggle': {
+      needRust();
+      const name = args.join(' ');
+      if (!name) return { lines: [`Укажи имя: !${cmd} свет (список: !sw)`] };
+      const targets = name.toLowerCase() === 'all' || name.toLowerCase() === 'все'
+        ? dev.byType(dev.TYPE.SWITCH)
+        : [dev.findByName(name)].filter(Boolean);
+      if (!targets.length) return { lines: [`Не нашёл «${name}». Список: !sw`] };
+      const lines = [];
+      for (const d of targets) {
+        if (d.type !== dev.TYPE.SWITCH) { lines.push(`${d.name} — это не переключатель`); continue; }
+        try {
+          let value;
+          if (cmd === 't' || cmd === 'toggle') value = !(switchState.has(d.id) ? switchState.get(d.id) : await refreshDevice(d));
+          else value = cmd === 'on' || cmd === 'вкл';
+          await setSwitch(d, value);
+          lines.push(`${value ? '🟢' : '🔴'} ${d.name}: ${stateText(value)}`);
+        } catch (e) { lines.push(`⚠️ ${d.name}: ${errText(e)}`); }
+        if (targets.length > 1) await new Promise((r) => setTimeout(r, 400));
+      }
+      return { lines, action: `${who}: ${lines.join(', ')}` };
+    }
+
+    case 'name': case 'имя': {
+      if (args.length !== 2) return { lines: ['Пример: !name свитч свет'] };
+      const r = dev.rename(args[0], args[1]);
+      return { lines: [r.error ? `⚠️ ${r.error}` : `✏️ Теперь называется «${r.device.name}»`] };
+    }
+
+    case 'del': case 'удалить': {
+      const d = dev.remove(args.join(' '));
+      return { lines: [d ? `🗑️ «${d.name}» удалён из списка` : 'Не нашёл такое устройство'] };
+    }
+  }
+  return null;
+}
+
+const plain = (s) => s.replace(/[🟢🔴🚨⚠️✏️🗑️]/gu, '').replace(/\s+/g, ' ').trim();
+
 // ---------- мост чата ----------
-function onTeamMessage(msg) {
+async function onTeamMessage(msg) {
   const text = msg.message;
   // пропускаем то, что отправил сам бот
   const t = sentEcho.get(text);
   if (t && Date.now() - t < 60000) { sentEcho.delete(text); return; }
   toDiscord(`💬 **${msg.name}**: ${text}`);
+
+  if (text.startsWith('!')) {
+    try {
+      const res = await runCommand(text, msg.name);
+      if (res) {
+        res.lines.forEach((l) => toTeamChat(`[BOT] ${plain(l)}`));
+        toDiscord(res.lines.join('\n'));
+      }
+    } catch (e) { toTeamChat(`[BOT] Ошибка: ${errText(e)}`); }
+  }
 }
 
-discord.on('messageCreate', (m) => {
+discord.on('messageCreate', async (m) => {
   if (m.author.bot || m.channelId !== cfg.channelId || !m.content) return;
-  if (!rust) return m.react('⚠️').catch(() => {});
   const name = m.member?.displayName || m.author.username;
+
+  if (m.content.startsWith('!')) {
+    try {
+      const res = await runCommand(m.content, name);
+      if (res) {
+        await m.reply({ content: res.lines.join('\n'), allowedMentions: { parse: [] } });
+        if (res.action && cfg.toTeamChat) toTeamChat(`[BOT] ${plain(res.action)}`);
+        return;
+      }
+    } catch (e) {
+      return m.reply(`⚠️ ${errText(e)}`).catch(() => {});
+    }
+  }
+
+  if (!rust) return m.react('⚠️').catch(() => {});
   toTeamChat(`[DS] ${name}: ${m.content.replace(/\s+/g, ' ')}`);
 });
 
@@ -191,7 +350,8 @@ function connectRust() {
       const ti = await r.sendRequestAsync({ getTeamInfo: {} });
       processTeam(ti.teamInfo, true);
       await pollEvents();
-      toDiscord(`✅ Подключился к **${info.info.name}** — онлайн ${info.info.players}/${info.info.maxPlayers}, в пачке ${team.size} чел.`, 0x2ecc71);
+      await subscribeAll();
+      toDiscord(`✅ Подключился к **${info.info.name}** — онлайн ${info.info.players}/${info.info.maxPlayers}, в пачке ${team.size} чел., устройств ${dev.all().length}. Команды: \`!help\``, 0x2ecc71);
     } catch (e) {
       log('Ошибка при старте:', e.message || e);
       toDiscord('⚠️ Подключился, но сервер не отдал данные. Проверь playerToken (мог смениться после вайпа — сделай Pair заново).');
@@ -205,6 +365,7 @@ function connectRust() {
     if (!b) return;
     if (b.teamMessage) onTeamMessage(b.teamMessage.message);
     if (b.teamChanged) processTeam(b.teamChanged.teamInfo);
+    if (b.entityChanged) onEntityChanged(b.entityChanged);
   });
 
   r.on('error', (e) => log('Rust+ ошибка:', e.message || e));
@@ -231,6 +392,7 @@ discord.once('clientReady', async () => {
     process.exit(1);
   }
   connectRust();
+  startFcm(onPairing, log);
 });
 
 process.on('unhandledRejection', (e) => log('unhandledRejection:', e?.message || e));
