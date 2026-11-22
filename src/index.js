@@ -433,6 +433,7 @@ async function onTeamMessage(msg) {
 
 discord.on('messageCreate', async (m) => {
   if (m.author.bot || m.channelId !== cfg.channelId || !m.content) return;
+  if (m.content.startsWith('!')) log(`Команда из Discord от ${m.author.username}: ${m.content}`);
   const name = m.member?.displayName || m.author.username;
 
   if (m.content.startsWith('!')) {
@@ -445,7 +446,8 @@ discord.on('messageCreate', async (m) => {
         return;
       }
     } catch (e) {
-      return m.reply(`⚠️ ${errText(e)}`).catch(() => {});
+      log('Ошибка команды:', e?.stack || errText(e));
+      return m.reply(`⚠️ ${errText(e)}`).catch((e2) => log('Не смог ответить в Discord:', e2.message));
     }
   }
 
@@ -521,5 +523,6 @@ discord.once('clientReady', async () => {
   startFcm(onPairing, log);
 });
 
-process.on('unhandledRejection', (e) => log('unhandledRejection:', e?.message || e));
+process.on('unhandledRejection', (e) => log('unhandledRejection:', e?.stack || e?.message || e));
+process.on('uncaughtException', (e) => log('uncaughtException:', e?.stack || e?.message || e));
 discord.login(cfg.discordToken);
