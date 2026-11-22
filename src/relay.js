@@ -24,6 +24,17 @@ function loadAuthToken() {
   return t;
 }
 
+// Новые серверы Rust не присылают часть полей, помеченных в старом .proto как required —
+// делаем все поля optional, чтобы расшифровка не падала.
+let rootCache = null;
+function loadRoot() {
+  if (!rootCache) {
+    const text = fs.readFileSync(PROTO, 'utf8').replace(/\brequired\b/g, 'optional');
+    rootCache = protobuf.parse(text).root;
+  }
+  return rootCache;
+}
+
 class RelayRustPlus extends RustPlus {
   constructor(serverId, authToken, playerId, playerToken) {
     super('relay', 0, playerId, playerToken);
@@ -32,7 +43,7 @@ class RelayRustPlus extends RustPlus {
   }
 
   connect() {
-    protobuf.load(PROTO).then((root) => {
+    Promise.resolve(loadRoot()).then((root) => {
       if (this.websocket) this.disconnect();
       this.AppRequest = root.lookupType('rustplus.AppRequest');
       this.AppMessage = root.lookupType('rustplus.AppMessage');
@@ -53,7 +64,14 @@ class RelayRustPlus extends RustPlus {
         this.emit('disconnected');
       });
       this.websocket.on('message', (data) => {
-        const message = this.AppMessage.decode(data);
+        let message;
+        try {
+          message = this.AppMessage.decode(data);
+        } catch (e) {
+          // если всё же не хватает поля — берём то, что удалось разобрать
+          if (e.instance) message = e.instance;
+          else { this.emit('error', e); return; }
+        }
         if (message.response && message.response.seq && this.seqCallbacks[message.response.seq]) {
           const cb = this.seqCallbacks[message.response.seq];
           const handled = cb(message);
