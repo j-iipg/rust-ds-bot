@@ -8,6 +8,8 @@ const accounts = require('./accounts');
 const { toGrid } = require('./grid');
 const dev = require('./switches');
 const { startFcm } = require('./fcm');
+const { renderMap } = require('./map');
+const reminders = require('./timers');
 
 // ---------- конфиг ----------
 const cfg = {
@@ -298,6 +300,9 @@ function onPairing(body, account) {
 }
 
 const HELP = [
+  '!map — карта с пачкой и ивентами',
+  '!time — время в игре, сколько до ночи/утра',
+  '!timer 10m печь — напоминание (!timers — список, !timer del <номер>)',
   '!link — добавить свой аккаунт (файл в ЛС боту), чтобы привязывать без владельца',
   '!accounts — привязанные аккаунты и сколько дней живут токены',
   '!team — кто в пачке, онлайн и где',
@@ -386,6 +391,54 @@ async function runCommand(text, who) {
       return { lines: [`👑 Лидер теперь ${target.name}`], action: `${who}: лидер теперь ${target.name}` };
     }
 
+    case 'map': case 'карта': {
+      needRust();
+      const sid = server.RUST_SERVER_ID || server.RUST_IP;
+      if (!mapCache || mapCache.sid !== sid) {
+        const res = await rust.sendRequestAsync({ getMap: {} }, 30000);
+        mapCache = { sid, map: res.map };
+      }
+      const [ti, mk] = await Promise.all([
+        rust.sendRequestAsync({ getTeamInfo: {} }),
+        rust.sendRequestAsync({ getMapMarkers: {} }),
+      ]);
+      const jpg = await renderMap({
+        map: mapCache.map, mapSize,
+        members: ti.teamInfo.members || [],
+        markers: mk.mapMarkers.markers || [],
+      });
+      return { lines: ['🗺️ Карта отправлена в Discord'], files: [{ attachment: jpg, name: 'map.jpg' }], discordText: '🗺️ Карта сервера' };
+    }
+
+    case 'time': case 'время': {
+      needRust();
+      const { time: t } = await rust.sendRequestAsync({ getTime: {} });
+      const hhmm = (h) => { const x = ((h % 24) + 24) % 24; return `${String(Math.floor(x)).padStart(2, '0')}:${String(Math.floor((x % 1) * 60)).padStart(2, '0')}`; };
+      const isDay = t.time >= t.sunrise && t.time < t.sunset;
+      const gameHoursLeft = isDay ? t.sunset - t.time : ((t.sunrise - t.time) + 24) % 24;
+      // примерно: dayLengthMinutes — длина суток в реальных минутах, ночь идёт быстрее в timeScale раз
+      const perHour = (t.dayLengthMinutes || 60) / 24;
+      const realMin = Math.round(gameHoursLeft * perHour / (isDay ? 1 : (t.timeScale || 1)));
+      return { lines: [`${isDay ? '☀️' : '🌙'} В игре ${hhmm(t.time)} — до ${isDay ? 'ночи' : 'утра'} ≈ ${realMin} мин (${isDay ? 'закат' : 'рассвет'} в ${hhmm(isDay ? t.sunset : t.sunrise)})`] };
+    }
+
+    case 'timer': case 'таймер': {
+      if (!args.length) return { lines: ['Пример: !timer 10m печь  ·  !timers — список  ·  !timer del 1'] };
+      if (['del', 'удалить', 'stop', 'стоп'].includes(args[0].toLowerCase())) {
+        const t = reminders.remove(args.slice(1).join(' '));
+        return { lines: [t ? `🗑️ Таймер «${t.name}» удалён` : 'Не нашёл таймер. Список: !timers'] };
+      }
+      const r = reminders.add(args[0], args.slice(1).join(' '), who);
+      if (r.error) return { lines: [`⚠️ ${r.error}`] };
+      return { lines: [`⏰ Таймер #${r.timer.id} «${r.timer.name}» — через ${reminders.fmtLeft(r.ms)}`] };
+    }
+
+    case 'timers': case 'таймеры': {
+      const list = reminders.all();
+      if (!list.length) return { lines: ['Таймеров нет. Поставить: !timer 10m печь'] };
+      return { lines: list.map((t) => `⏰ #${t.id} ${t.name} — через ${reminders.fmtLeft(t.at - Date.now())} (${t.who})`) };
+    }
+
     case 'accounts': case 'аккаунты': {
       const list = accounts.all();
       if (!list.length) return { lines: ['Нет аккаунтов'] };
@@ -421,7 +474,7 @@ async function runCommand(text, who) {
   return null;
 }
 
-const plain = (s) => s.replace(/[🟢🔴⚫👑🚨⚠️✏️🗑️]/gu, '').replace(/\s+/g, ' ').trim();
+const plain = (s) => s.replace(/[🟢🔴⚫👑🚨⚠️✏️🗑️⏰☀️🌙🗺️]/gu, '').replace(/\s+/g, ' ').trim();
 
 
 // ---------- пульт с кнопками ----------
@@ -596,7 +649,8 @@ async function onTeamMessage(msg) {
       const res = await runCommand(text, msg.name);
       if (res) {
         res.lines.forEach((l) => toTeamChat(`[BOT] ${plain(l)}`));
-        if (!res.silentDiscord) toDiscord(res.lines.join('\n'));
+        if (res.files && channel) channel.send({ content: `${res.discordText || ''} (запросил ${msg.name})`, files: res.files }).catch((e) => log('Discord файл:', e.message));
+        else if (!res.silentDiscord) toDiscord(res.lines.join('\n'));
       }
     } catch (e) { toTeamChat(`[BOT] Ошибка: ${errText(e)}`); }
   }
@@ -619,6 +673,10 @@ discord.on('messageCreate', async (m) => {
       const res = await runCommand(m.content, name);
       if (res) {
         if (res.silentDiscord) { m.delete().catch(() => {}); return; }
+        if (res.files) {
+          await m.reply({ content: res.discordText || '', files: res.files, allowedMentions: { parse: [] } });
+          return;
+        }
         await m.reply({ content: res.lines.join('\n'), allowedMentions: { parse: [] } });
         if (res.action && cfg.toTeamChat) toTeamChat(`[BOT] ${plain(res.action)}`);
         return;
@@ -635,6 +693,7 @@ discord.on('messageCreate', async (m) => {
 
 // ---------- подключение к Rust+ ----------
 let currentClient = null;
+let mapCache = null; // { sid, map } — картинка карты не меняется до вайпа
 
 function switchServer(body, who) {
   server = {
@@ -736,6 +795,8 @@ discord.once('clientReady', async () => {
     console.error('Не нашёл канал DISCORD_CHANNEL_ID — проверь ID и что бот добавлен на сервер');
     process.exit(1);
   }
+  reminders.init((t) => notify(`⏰ **Таймер «${t.name}»** — время вышло! (поставил ${t.who})`,
+                            `[BOT] ТАЙМЕР «${t.name}» — время вышло! (${t.who})`, 0xf1c40f));
   accounts.load();
   for (const a of accounts.all()) runFcm(a);
   if (!accounts.all().length) log('Нет ни одного Rust+ аккаунта — выполни npm run register');
