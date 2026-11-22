@@ -566,6 +566,8 @@ async function handleLink(m) {
     if (r.error) return reply(`⚠️ Не подошёл файл: ${r.error}`);
     runFcm(r.account);
     log(`Добавлен аккаунт ${r.account.name} (${r.account.steamId})`);
+    // если бот ещё ни разу не подключился (не было токена) — пробуем сейчас
+    if (!rust && !currentClient) setTimeout(connectRust, 1000);
     reply(`✅ Аккаунт **${r.account.name}** добавлен, токен живёт ещё ${accounts.daysLeft(r.account)} дн.\n` +
           'Теперь зайди на сервер → Esc → Rust+ → **Pair with server**. После этого можешь привязывать переключатели (E → Pair).');
     toDiscord(`👤 **${r.account.name}** ${r.isNew ? 'добавил' : 'обновил'} свой Rust+ аккаунт`, 0x3498db);
