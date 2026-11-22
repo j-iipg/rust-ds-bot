@@ -1,6 +1,8 @@
 require('dotenv').config();
 const { createRustClient } = require('./relay');
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
 const { toGrid } = require('./grid');
 const dev = require('./switches');
 const { startFcm } = require('./fcm');
@@ -185,13 +187,14 @@ async function subscribeAll() {
 async function setSwitch(d, value) {
   await rust.sendRequestAsync({ entityId: d.id, setEntityValue: { value } });
   switchState.set(d.id, value);
+  updatePanel();
 }
 
 function onEntityChanged(ch) {
   const d = dev.get(ch.entityId);
   if (!d) return;
   const v = !!ch.payload?.value;
-  if (d.type === dev.TYPE.SWITCH) switchState.set(d.id, v);
+  if (d.type === dev.TYPE.SWITCH) { switchState.set(d.id, v); updatePanel(); }
   if (d.type === dev.TYPE.ALARM && v) {
     notify(`🚨 **Сработал аларм «${d.name}»!**`, `[BOT] !!! Сработал аларм ${d.name} !!!`, 0xff0000);
   }
@@ -215,10 +218,12 @@ function onPairing(body) {
   const kind = type === dev.TYPE.ALARM ? 'Smart Alarm' : 'Smart Switch';
   notify(`🔗 Привязан **${kind}** → имя **${device.name}**\nПереименовать: \`!name ${device.name} новое_имя\``,
          `[BOT] Привязан ${kind}: ${device.name}. Переименовать: !name ${device.name} имя`, 0x3498db);
-  if (rust) refreshDevice(device).catch(() => {});
+  if (rust) refreshDevice(device).catch(() => {}).finally(updatePanel);
+  else updatePanel();
 }
 
 const HELP = [
+  '!panel — пульт с кнопками в Discord',
   '!sw — список переключателей и алармов',
   '!on <имя> / !off <имя> — включить / выключить (можно all)',
   '!t <имя> — переключить',
@@ -273,14 +278,22 @@ async function runCommand(text, who) {
       return { lines, action: `${who}: ${lines.join(', ')}` };
     }
 
+    case 'panel': case 'пульт': {
+      if (!channel) return { lines: ['Discord ещё не готов'] };
+      await postPanel();
+      return { lines: ['🎛️ Пульт отправлен в Discord-канал'], silentDiscord: true };
+    }
+
     case 'name': case 'имя': {
       if (args.length !== 2) return { lines: ['Пример: !name свитч свет'] };
       const r = dev.rename(args[0], args[1]);
+      if (!r.error) updatePanel();
       return { lines: [r.error ? `⚠️ ${r.error}` : `✏️ Теперь называется «${r.device.name}»`] };
     }
 
     case 'del': case 'удалить': {
       const d = dev.remove(args.join(' '));
+      if (d) { switchState.delete(d.id); updatePanel(); }
       return { lines: [d ? `🗑️ «${d.name}» удалён из списка` : 'Не нашёл такое устройство'] };
     }
   }
@@ -288,6 +301,116 @@ async function runCommand(text, who) {
 }
 
 const plain = (s) => s.replace(/[🟢🔴🚨⚠️✏️🗑️]/gu, '').replace(/\s+/g, ' ').trim();
+
+
+// ---------- пульт с кнопками ----------
+const PANEL_FILE = path.join(process.cwd(), 'data', 'panel.json');
+let panelMsgId = null;
+try { panelMsgId = JSON.parse(fs.readFileSync(PANEL_FILE, 'utf8')).messageId || null; } catch {}
+function savePanel() {
+  fs.mkdirSync(path.dirname(PANEL_FILE), { recursive: true });
+  fs.writeFileSync(PANEL_FILE, JSON.stringify({ messageId: panelMsgId }));
+}
+
+function buildPanel() {
+  const switches = dev.byType(dev.TYPE.SWITCH).slice(0, 20);
+  const alarms = dev.byType(dev.TYPE.ALARM);
+  const lines = switches.map((d) => {
+    const v = switchState.get(d.id);
+    return `${v === true ? '🟢' : v === false ? '🔴' : '⚪'} **${d.name}** — ${stateText(v)}`;
+  });
+  if (alarms.length) lines.push('', ...alarms.map((d) => `🚨 ${d.name} — аларм`));
+  if (!lines.length) lines.push('Нет устройств. В игре: смотри на Smart Switch → зажми **E** → **Pair**');
+
+  const embed = new EmbedBuilder()
+    .setTitle('🎛️ Пульт базы')
+    .setDescription(lines.join('\n') + (rust ? '' : '\n\n⚠️ Бот сейчас не подключён к Rust+'))
+    .setColor(rust ? 0x2ecc71 : 0x95a5a6)
+    .setFooter({ text: 'Нажми кнопку, чтобы переключить' })
+    .setTimestamp();
+
+  const rows = [];
+  for (let i = 0; i < switches.length; i += 5) {
+    rows.push(new ActionRowBuilder().addComponents(switches.slice(i, i + 5).map((d) => {
+      const v = switchState.get(d.id);
+      return new ButtonBuilder()
+        .setCustomId(`sw:${d.id}`)
+        .setLabel(d.name.slice(0, 80))
+        .setStyle(v === true ? ButtonStyle.Success : v === false ? ButtonStyle.Danger : ButtonStyle.Secondary)
+        .setDisabled(!rust);
+    })));
+  }
+  rows.push(new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('all:on').setLabel('Все ВКЛ').setEmoji('🟢').setStyle(ButtonStyle.Secondary).setDisabled(!rust || !switches.length),
+    new ButtonBuilder().setCustomId('all:off').setLabel('Все ВЫКЛ').setEmoji('🔴').setStyle(ButtonStyle.Secondary).setDisabled(!rust || !switches.length),
+    new ButtonBuilder().setCustomId('refresh').setLabel('Обновить').setEmoji('🔄').setStyle(ButtonStyle.Primary),
+  ));
+  return { embeds: [embed], components: rows };
+}
+
+// создать новый пульт (старый удаляется)
+async function postPanel() {
+  if (!channel) return;
+  if (panelMsgId) {
+    try { await (await channel.messages.fetch(panelMsgId)).delete(); } catch {}
+  }
+  const msg = await channel.send(buildPanel());
+  panelMsgId = msg.id;
+  savePanel();
+}
+
+// обновить существующий пульт (с небольшой задержкой, чтобы не дёргать Discord на каждое изменение)
+let panelTimer = null;
+function updatePanel() {
+  if (!panelMsgId || !channel) return;
+  clearTimeout(panelTimer);
+  panelTimer = setTimeout(async () => {
+    try {
+      const msg = await channel.messages.fetch(panelMsgId);
+      await msg.edit(buildPanel());
+    } catch (e) {
+      if (e.code === 10008) { panelMsgId = null; savePanel(); } // сообщение удалили
+      else log('Пульт: не смог обновить:', e.message);
+    }
+  }, 800);
+}
+
+discord.on('interactionCreate', async (i) => {
+  if (!i.isButton()) return;
+  const who = i.member?.displayName || i.user.username;
+  try {
+    await i.deferUpdate();
+    if (i.customId === 'refresh') {
+      if (rust) for (const d of dev.byType(dev.TYPE.SWITCH)) { try { await refreshDevice(d); } catch {} }
+    } else {
+      if (!rust) return;
+      let targets, value = null;
+      if (i.customId.startsWith('all:')) {
+        targets = dev.byType(dev.TYPE.SWITCH);
+        value = i.customId === 'all:on';
+      } else {
+        const d = dev.get(Number(i.customId.slice(3)));
+        if (!d) return i.followUp({ content: 'Этого переключателя больше нет', flags: MessageFlags.Ephemeral });
+        targets = [d];
+      }
+      const done = [];
+      for (const d of targets) {
+        try {
+          const v = value ?? !(switchState.has(d.id) ? switchState.get(d.id) : await refreshDevice(d));
+          await setSwitch(d, v);
+          done.push(`${d.name} ${stateText(v)}`);
+        } catch (e) {
+          await i.followUp({ content: `⚠️ ${d.name}: ${errText(e)}`, flags: MessageFlags.Ephemeral });
+        }
+        if (targets.length > 1) await new Promise((r) => setTimeout(r, 400));
+      }
+      if (done.length && cfg.toTeamChat) toTeamChat(`[BOT] ${who}: ${done.join(', ')}`);
+    }
+  } catch (e) {
+    log('Кнопка: ошибка:', e.message || e);
+  }
+  updatePanel();
+});
 
 // ---------- мост чата ----------
 async function onTeamMessage(msg) {
@@ -302,7 +425,7 @@ async function onTeamMessage(msg) {
       const res = await runCommand(text, msg.name);
       if (res) {
         res.lines.forEach((l) => toTeamChat(`[BOT] ${plain(l)}`));
-        toDiscord(res.lines.join('\n'));
+        if (!res.silentDiscord) toDiscord(res.lines.join('\n'));
       }
     } catch (e) { toTeamChat(`[BOT] Ошибка: ${errText(e)}`); }
   }
@@ -316,6 +439,7 @@ discord.on('messageCreate', async (m) => {
     try {
       const res = await runCommand(m.content, name);
       if (res) {
+        if (res.silentDiscord) { m.delete().catch(() => {}); return; }
         await m.reply({ content: res.lines.join('\n'), allowedMentions: { parse: [] } });
         if (res.action && cfg.toTeamChat) toTeamChat(`[BOT] ${plain(res.action)}`);
         return;
@@ -351,6 +475,7 @@ function connectRust() {
       processTeam(ti.teamInfo, true);
       await pollEvents();
       await subscribeAll();
+      updatePanel();
       toDiscord(`✅ Подключился к **${info.info.name}** — онлайн ${info.info.players}/${info.info.maxPlayers}, в пачке ${team.size} чел., устройств ${dev.all().length}. Команды: \`!help\``, 0x2ecc71);
     } catch (e) {
       log('Ошибка при старте:', e.message || e);
@@ -375,6 +500,7 @@ function connectRust() {
     log('Rust+ отключён');
     rust = null;
     markers = null;
+    updatePanel();
     timers.forEach(clearInterval);
     timers = [];
     setTimeout(connectRust, 20000);
