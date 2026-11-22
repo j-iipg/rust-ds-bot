@@ -1,5 +1,5 @@
 require('dotenv').config();
-const RustPlus = require('@liamcottle/rustplus.js');
+const { createRustClient } = require('./relay');
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const { toGrid } = require('./grid');
 
@@ -15,7 +15,9 @@ const cfg = {
   teamPoll: Number(process.env.TEAM_POLL_SECONDS || 5) * 1000,
   eventsPoll: Number(process.env.EVENTS_POLL_SECONDS || 10) * 1000,
 };
-for (const k of ['discordToken', 'channelId', 'ip', 'port', 'playerId', 'playerToken']) {
+const required = ['discordToken', 'channelId', 'playerId', 'playerToken'];
+if (!process.env.RUST_SERVER_ID) required.push('ip', 'port');
+for (const k of required) {
   if (!cfg[k]) { console.error(`Не заполнено в .env: ${k}`); process.exit(1); }
 }
 
@@ -170,8 +172,15 @@ discord.on('messageCreate', (m) => {
 
 // ---------- подключение к Rust+ ----------
 function connectRust() {
-  log(`Подключаюсь к Rust+ ${cfg.ip}:${cfg.port}...`);
-  const r = new RustPlus(cfg.ip, cfg.port, cfg.playerId, cfg.playerToken);
+  let r, label;
+  try {
+    ({ client: r, label } = createRustClient(process.env));
+  } catch (e) {
+    log(e.message);
+    toDiscord(`⚠️ ${e.message}`);
+    return;
+  }
+  log(`Подключаюсь к Rust+ (${label})...`);
 
   r.on('connected', async () => {
     rust = r;

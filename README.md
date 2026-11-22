@@ -15,8 +15,10 @@
 4. **Rust+**:
    - `npm run register` — откроется Chrome, войди через Steam
    - `npm run pair` — не закрывай; в игре Esc → Rust+ → **Pair with server**
-   - в консоли появятся `ip`, `port`, `playerId`, `playerToken`
-5. Скопируй `.env.example` → `.env` и заполни.
+   - в консоли появится `body` с `"id"`, `"playerId"`, `"playerToken"`
+5. Скопируй `.env.example` → `.env` и заполни: `RUST_SERVER_ID` = `id`, плюс `RUST_PLAYER_ID` и `RUST_PLAYER_TOKEN`.
+
+> С ноября 2026 Facepunch отключил прямые подключения Rust+ — бот ходит через relay `companion-rust.facepunch.com/socket/<id>` с Rust+ токеном из `rustplus.config.json`. Токен живёт ~14 дней: если бот пишет про HTTP 401/403 — снова `npm run register`.
 6. Запусти `start.bat` (сам перезапускает бота при падении) или `npm start`.
 
 ## Важно
@@ -24,5 +26,6 @@
 - Привязанный аккаунт должен быть в той же команде — бот видит только свою пачку.
 - Сообщения в тим-чат идут от имени привязанного ника.
 - После вайпа может понадобиться заново `npm run pair`.
+- Раз в ~2 недели: `npm run register` (обновить Rust+ токен).
 - `POST_TO_TEAMCHAT=false` в `.env` — уведомления только в Discord (мост чата работает).
 - `.env` и `rustplus.config.json` содержат токены — не коммить их (уже в `.gitignore`).
