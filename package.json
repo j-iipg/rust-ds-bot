@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "register": "rustplus fcm-register",
-    "pair": "rustplus fcm-listen"
+    "pair": "rustplus fcm-listen",
+    "findport": "node src/findport.js"
   },
   "keywords": [],
   "author": "",
