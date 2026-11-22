@@ -18,12 +18,16 @@ function startFcm(onPairing, log) {
 
   const { androidId, securityToken } = config.fcm_credentials.gcm;
   const client = new PushReceiverClient(androidId, securityToken, []);
+  const startedAt = Date.now();
 
   client.on('ON_DATA_RECEIVED', (data) => {
     try {
       const get = (k) => (data.appData || []).find((x) => x.key === k)?.value;
       const bodyRaw = get('body');
       if (!bodyRaw) return;
+      // FCM может заново прислать старые уведомления при запуске — их пропускаем
+      const sent = Number(data.sent || 0);
+      if (sent && sent < startedAt - 60 * 1000) return;
       const body = JSON.parse(bodyRaw);
       onPairing(body);
     } catch (e) {

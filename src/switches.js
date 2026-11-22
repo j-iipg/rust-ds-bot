@@ -3,11 +3,21 @@
 const fs = require('fs');
 const path = require('path');
 
-const FILE = path.join(process.cwd(), 'data', 'devices.json');
+const DIR = path.join(process.cwd(), 'data');
+const LEGACY = path.join(DIR, 'devices.json');
 const TYPE = { SWITCH: 1, ALARM: 2, STORAGE: 3 };
 
+// у каждого сервера свой список устройств: data/devices-<serverId>.json
+let FILE = LEGACY;
 let devices = {};
-try { devices = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch {}
+function setServer(serverId) {
+  FILE = path.join(DIR, `devices-${serverId || 'default'}.json`);
+  if (!fs.existsSync(FILE) && fs.existsSync(LEGACY)) {
+    fs.mkdirSync(DIR, { recursive: true });
+    fs.renameSync(LEGACY, FILE); // старый общий список переносим на текущий сервер
+  }
+  try { devices = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { devices = {}; }
+}
 
 function save() {
   fs.mkdirSync(path.dirname(FILE), { recursive: true });
@@ -59,4 +69,4 @@ function remove(name) {
   return d;
 }
 
-module.exports = { TYPE, all, byType, get, findByName, add, rename, remove };
+module.exports = { setServer, TYPE, all, byType, get, findByName, add, rename, remove };

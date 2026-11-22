@@ -1,8 +1,9 @@
 require('dotenv').config();
-const { createRustClient } = require('./relay');
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
+const { createRustClient } = require('./relay');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags } = require('discord.js');
+
 const { toGrid } = require('./grid');
 const dev = require('./switches');
 const { startFcm } = require('./fcm');
@@ -19,10 +20,23 @@ const cfg = {
   teamPoll: Number(process.env.TEAM_POLL_SECONDS || 5) * 1000,
   eventsPoll: Number(process.env.EVENTS_POLL_SECONDS || 10) * 1000,
 };
-const required = ['discordToken', 'channelId', 'playerId', 'playerToken'];
-if (!process.env.RUST_SERVER_ID) required.push('ip', 'port');
-for (const k of required) {
+// Текущий сервер: data/server.json (сохраняется при Pair в игре) важнее, чем .env
+const SERVER_FILE = path.join(process.cwd(), 'data', 'server.json');
+let server = {
+  RUST_SERVER_ID: process.env.RUST_SERVER_ID,
+  RUST_IP: process.env.RUST_IP,
+  RUST_PORT: process.env.RUST_PORT,
+  RUST_PLAYER_ID: process.env.RUST_PLAYER_ID,
+  RUST_PLAYER_TOKEN: process.env.RUST_PLAYER_TOKEN,
+  name: null,
+};
+try { Object.assign(server, JSON.parse(fs.readFileSync(SERVER_FILE, 'utf8'))); } catch {}
+
+for (const k of ['discordToken', 'channelId']) {
   if (!cfg[k]) { console.error(`Не заполнено в .env: ${k}`); process.exit(1); }
+}
+if (!server.RUST_PLAYER_ID || !server.RUST_PLAYER_TOKEN || (!server.RUST_SERVER_ID && !server.RUST_IP)) {
+  console.log('Сервер Rust ещё не привязан — зайди в игру и нажми Rust+ → Pair with server, бот подхватит сам.');
 }
 
 const log = (...a) => console.log(new Date().toLocaleTimeString(), ...a);
@@ -203,7 +217,7 @@ function onEntityChanged(ch) {
 // привязка из игры (смотришь на устройство → зажать E → Pair)
 function onPairing(body) {
   if (body.type === 'server') {
-    log(`Пришла привязка сервера: ${body.name} (id ${body.id})`);
+    if (body.id && body.playerToken) switchServer(body);
     return;
   }
   if (body.type !== 'entity' || !body.entityId) return;
@@ -223,6 +237,8 @@ function onPairing(body) {
 }
 
 const HELP = [
+  '!team — кто в пачке, онлайн и где',
+  '!leader <ник> — передать лидерство',
   '!panel — пульт с кнопками в Discord',
   '!sw — список переключателей и алармов',
   '!on <имя> / !off <имя> — включить / выключить (можно all)',
@@ -284,6 +300,29 @@ async function runCommand(text, who) {
       return { lines: ['🎛️ Пульт отправлен в Discord-канал'], silentDiscord: true };
     }
 
+    case 'team': case 'пачка': {
+      needRust();
+      const res = await rust.sendRequestAsync({ getTeamInfo: {} });
+      const leader = String(res.teamInfo.leaderSteamId);
+      return { lines: (res.teamInfo.members || []).map((m) =>
+        `${m.isOnline ? '🟢' : '⚫'} ${m.name}${String(m.steamId) === leader ? ' 👑' : ''} — ${m.isAlive ? grid(m.x, m.y) : 'мёртв'}`) };
+    }
+
+    case 'leader': case 'лидер': {
+      needRust();
+      const name = args.join(' ').toLowerCase();
+      if (!name) return { lines: ['Пример: !leader Gleb'] };
+      const res = await rust.sendRequestAsync({ getTeamInfo: {} });
+      const members = res.teamInfo.members || [];
+      const target = members.find((m) => m.name.toLowerCase() === name) || members.find((m) => m.name.toLowerCase().includes(name));
+      if (!target) return { lines: [`Не нашёл «${args.join(' ')}» в пачке`] };
+      if (String(res.teamInfo.leaderSteamId) !== String(server.RUST_PLAYER_ID)) {
+        return { lines: ['⚠️ Передать лидерство может только лидер, а аккаунт бота сейчас не лидер'] };
+      }
+      await rust.sendRequestAsync({ promoteToLeader: { steamId: target.steamId } });
+      return { lines: [`👑 Лидер теперь ${target.name}`], action: `${who}: лидер теперь ${target.name}` };
+    }
+
     case 'name': case 'имя': {
       if (args.length !== 2) return { lines: ['Пример: !name свитч свет'] };
       const r = dev.rename(args[0], args[1]);
@@ -300,7 +339,7 @@ async function runCommand(text, who) {
   return null;
 }
 
-const plain = (s) => s.replace(/[🟢🔴🚨⚠️✏️🗑️]/gu, '').replace(/\s+/g, ' ').trim();
+const plain = (s) => s.replace(/[🟢🔴⚫👑🚨⚠️✏️🗑️]/gu, '').replace(/\s+/g, ' ').trim();
 
 
 // ---------- пульт с кнопками ----------
@@ -456,10 +495,47 @@ discord.on('messageCreate', async (m) => {
 });
 
 // ---------- подключение к Rust+ ----------
+let currentClient = null;
+
+function switchServer(body) {
+  const same = server.RUST_SERVER_ID === body.id && String(server.RUST_PLAYER_TOKEN) === String(body.playerToken);
+  if (same) return;
+  server = {
+    RUST_SERVER_ID: body.id,
+    RUST_PLAYER_ID: body.playerId,
+    RUST_PLAYER_TOKEN: body.playerToken,
+    RUST_IP: body.ip || '',
+    RUST_PORT: body.port || '',
+    name: body.name,
+  };
+  fs.mkdirSync(path.dirname(SERVER_FILE), { recursive: true });
+  fs.writeFileSync(SERVER_FILE, JSON.stringify(server, null, 2));
+  toDiscord(`🔄 Привязан сервер **${body.name}** — переключаюсь на него...`, 0x3498db);
+  log(`Переключаюсь на сервер ${body.name} (${body.id})`);
+
+  // отключаемся от старого сервера и сразу подключаемся к новому
+  timers.forEach(clearInterval);
+  timers = [];
+  rust = null;
+  markers = null;
+  team = new Map();
+  switchState.clear();
+  if (currentClient) {
+    currentClient.switching = true;
+    try { currentClient.disconnect(); } catch {}
+  }
+  connectRust();
+}
+
 function connectRust() {
+  if (!server.RUST_PLAYER_ID || !server.RUST_PLAYER_TOKEN || (!server.RUST_SERVER_ID && !server.RUST_IP)) {
+    log('Жду привязку сервера (Rust+ → Pair with server в игре)');
+    return;
+  }
+  dev.setServer(server.RUST_SERVER_ID || `${server.RUST_IP}_${server.RUST_PORT}`);
   let r, label;
   try {
-    ({ client: r, label } = createRustClient(process.env));
+    ({ client: r, label } = createRustClient(server));
   } catch (e) {
     log(e.message);
     toDiscord(`⚠️ ${e.message}`);
@@ -497,7 +573,9 @@ function connectRust() {
 
   r.on('error', (e) => log('Rust+ ошибка:', e.message || e));
 
+  currentClient = r;
   r.on('disconnected', () => {
+    if (r.switching) return; // переключаемся на другой сервер — переподключение сделает switchServer
     if (rust === r) toDiscord('🔌 Отключился от Rust+, переподключаюсь через 20 сек...', 0x95a5a6);
     log('Rust+ отключён');
     rust = null;
