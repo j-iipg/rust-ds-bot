@@ -1,9 +1,13 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const store = require('./store');
+const settings = require('./settings');
+const S = () => settings.get();
+store.key(); // создаст DATA_KEY в .env при первом запуске
 const { createRustClient } = require('./relay');
 const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags,
-  ActivityType, ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder } = require('discord.js');
+  ActivityType, PermissionFlagsBits, ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder, RoleSelectMenuBuilder } = require('discord.js');
 const accounts = require('./accounts');
 
 const { toGrid } = require('./grid');
@@ -21,6 +25,8 @@ const cfg = {
   playerId: process.env.RUST_PLAYER_ID,
   playerToken: process.env.RUST_PLAYER_TOKEN,
   toTeamChat: (process.env.POST_TO_TEAMCHAT || 'true') === 'true',
+  // кто может пользоваться ботом: роль (название или ID). Пусто — все, кто видит канал
+  accessRole: (process.env.ACCESS_ROLE || '').trim(),
   teamPoll: Number(process.env.TEAM_POLL_SECONDS || 5) * 1000,
   eventsPoll: Number(process.env.EVENTS_POLL_SECONDS || 10) * 1000,
 };
@@ -34,7 +40,7 @@ let server = {
   RUST_PLAYER_TOKEN: process.env.RUST_PLAYER_TOKEN,
   name: null,
 };
-try { Object.assign(server, JSON.parse(fs.readFileSync(SERVER_FILE, 'utf8'))); } catch {}
+Object.assign(server, store.read(SERVER_FILE, {}, { secret: true }));
 
 for (const k of ['discordToken', 'channelId']) {
   if (!cfg[k]) { console.error(`Не заполнено в .env: ${k}`); process.exit(1); }
@@ -81,6 +87,30 @@ let lastTime = null;     // последний getTime
 
 const footer = () => ({ text: `Rust Bot • ${serverInfo?.name || server.name || 'сервер не привязан'}` });
 
+// ---------- доступ ----------
+const isAdmin = (member) => !!member?.permissions?.has?.(PermissionFlagsBits.Administrator);
+function hasAccess(member) {
+  if (!member) return false;
+  const role = S().accessRole;
+  if (!role || isAdmin(member)) return true;
+  const r = role.toLowerCase();
+  return member.roles?.cache?.some((x) => x.id === role || x.name.toLowerCase() === r) || false;
+}
+// красивое имя роли: если в настройках ID — показываем <@&id>
+const roleLabel = () => { const r = S().accessRole; return /^\d{15,}$/.test(r) ? `<@&${r}>` : r; };
+const NO_ACCESS = () => `🔒 Нет доступа. Нужна роль ${roleLabel()} — попроси админа сервера.`;
+async function memberOf(userId) {
+  try { return await channel.guild.members.fetch(userId); } catch { return null; }
+}
+// не чаще одного действия в 1.2 сек на человека (защита от спама кнопками)
+const lastAction = new Map();
+function tooFast(userId, ms = 1200) {
+  const now = Date.now();
+  if (now - (lastAction.get(userId) || 0) < ms) return true;
+  lastAction.set(userId, now);
+  return false;
+}
+
 function card({ title, desc, color = COLOR.info, author, fields, image } = {}) {
   const e = new EmbedBuilder().setColor(color).setFooter(footer()).setTimestamp();
   if (author) e.setAuthor({ name: author });
@@ -125,6 +155,7 @@ async function pumpTeamQueue() {
   while (teamQueue.length && rust) {
     const msg = teamQueue.shift();
     sentEcho.set(msg, Date.now());
+    for (const [k, t] of sentEcho) if (Date.now() - t > 60000) sentEcho.delete(k); // чистим старое
     try { await rust.sendRequestAsync({ sendTeamMessage: { message: msg } }); }
     catch (e) { log('Team chat send error:', e.message || e); }
     await new Promise(r => setTimeout(r, 1500));
@@ -133,9 +164,24 @@ async function pumpTeamQueue() {
 }
 
 // Уведомление: в Discord (с эмодзи/цветом) и, если включено, в тим-чат
+// какой настройкой управляется уведомление (по первому эмодзи / тексту)
+function allowed(text) {
+  const st = S();
+  if (/^💀/.test(text)) return st.notifyDeaths;
+  if (/^(🟢|⚫)/.test(text)) return st.notifyOnline;
+  if (/^(➕|➖)/.test(text)) return st.notifyTeam;
+  if (/^(🚢|🚁|📦|💥)/.test(text)) {
+    if (!st.notifyEvents) return false;
+    const kind = /^🚢/.test(text) ? 'cargo' : /Чинук/.test(text) ? 'ch47' : /^🚁/.test(text) ? 'heli' : /^📦/.test(text) ? 'crate' : 'explosion';
+    return st.events.includes(kind);
+  }
+  return true;
+}
+
 function notify(discordText, gameText, color) {
+  if (!allowed(discordText)) return;
   toDiscord(discordText, color);
-  if (cfg.toTeamChat && gameText) toTeamChat(gameText);
+  if (S().toTeamChat && gameText) toTeamChat(gameText);
 }
 
 // ---------- пачка: смерти, онлайн, вход/выход из команды ----------
@@ -221,13 +267,12 @@ async function pollEvents() {
 // ---------- токены аккаунтов на сервере ----------
 // playerToken у каждого аккаунта свой для каждого сервера: data/tokens-<serverId>.json { steamId: token }
 const tokensFile = (sid) => path.join(process.cwd(), 'data', `tokens-${sid}.json`);
-function readTokens(sid) { try { return JSON.parse(fs.readFileSync(tokensFile(sid), 'utf8')); } catch { return {}; } }
+function readTokens(sid) { return store.read(tokensFile(sid), {}, { secret: true }); }
 function saveToken(sid, steamId, token) {
   if (!sid || !steamId || token === undefined) return;
   const t = readTokens(sid);
   t[String(steamId)] = String(token);
-  fs.mkdirSync(path.dirname(tokensFile(sid)), { recursive: true });
-  fs.writeFileSync(tokensFile(sid), JSON.stringify(t, null, 2));
+  store.write(tokensFile(sid), t, { secret: true });
 }
 
 // Подключения от имени других аккаунтов (для устройств, которые привязал тиммейт)
@@ -303,6 +348,9 @@ function onEntityChanged(ch) {
   if (d.type === dev.TYPE.SWITCH) { switchState.set(d.id, v); updatePanel(); }
   if (d.type === dev.TYPE.ALARM && v) {
     notify(`🚨 **Сработал аларм «${d.name}»!**`, `[BOT] !!! Сработал аларм ${d.name} !!!`, 0xff0000);
+    if (S().alarmPing && channel) {
+      channel.send({ content: `@everyone 🚨 **${d.name}** — тревога!`, allowedMentions: { parse: ['everyone'] } }).catch(() => {});
+    }
   }
 }
 
@@ -448,7 +496,7 @@ async function runCommand(text, who) {
 
     case 'map': case 'карта': {
       needRust();
-      const sid = server.RUST_SERVER_ID || server.RUST_IP;
+      const sid = `${server.RUST_SERVER_ID || server.RUST_IP}:${serverInfo?.seed}:${serverInfo?.salt}:${serverInfo?.wipeTime}`; // после вайпа карта новая
       if (!mapCache || mapCache.sid !== sid) {
         const res = await rust.sendRequestAsync({ getMap: {} }, 30000);
         mapCache = { sid, map: res.map };
@@ -552,10 +600,9 @@ const plain = (s) => s.replace(/[🟢🔴⚫👑🚨⚠️✏️🗑️⏰☀️
 // ---------- пульт с кнопками ----------
 const PANEL_FILE = path.join(process.cwd(), 'data', 'panel.json');
 let panelMsgId = null;
-try { panelMsgId = JSON.parse(fs.readFileSync(PANEL_FILE, 'utf8')).messageId || null; } catch {}
+panelMsgId = store.read(PANEL_FILE, {}).messageId || null;
 function savePanel() {
-  fs.mkdirSync(path.dirname(PANEL_FILE), { recursive: true });
-  fs.writeFileSync(PANEL_FILE, JSON.stringify({ messageId: panelMsgId }));
+  store.write(PANEL_FILE, { messageId: panelMsgId });
 }
 
 function buildPanel() {
@@ -623,10 +670,9 @@ function updatePanel() {
 // ---------- главное меню (дашборд с кнопками) ----------
 const MENU_FILE = path.join(process.cwd(), 'data', 'menu.json');
 let menuMsgId = null;
-try { menuMsgId = JSON.parse(fs.readFileSync(MENU_FILE, 'utf8')).messageId || null; } catch {}
+menuMsgId = store.read(MENU_FILE, {}).messageId || null;
 function saveMenu() {
-  fs.mkdirSync(path.dirname(MENU_FILE), { recursive: true });
-  fs.writeFileSync(MENU_FILE, JSON.stringify({ messageId: menuMsgId }));
+  store.write(MENU_FILE, { messageId: menuMsgId });
 }
 
 const btn = (id, label, emoji, style = ButtonStyle.Secondary) =>
@@ -653,7 +699,7 @@ function buildMenu() {
       { name: '🚨 Алармы', value: al.length ? String(al.length) : 'нет', inline: true },
       { name: '⏰ Таймеры', value: String(reminders.all().length), inline: true },
     ],
-  }).setFooter({ text: `${footer().text} • обновляется само` });
+  }).setFooter({ text: `${footer().text} • ${S().accessRole ? '🔒 доступ по роли' : '⚠️ доступ открыт всем в канале'}` });
 
   const rows = [
     new ActionRowBuilder().addComponents(
@@ -665,9 +711,13 @@ function buildMenu() {
     new ActionRowBuilder().addComponents(
       btn('m:timer', 'Таймер', '⏰'),
       btn('m:timers', 'Таймеры', '📋'),
-      btn('m:devices', 'Устройства', '⚙️'),
+      btn('m:devices', 'Устройства', '🔌'),
       btn('m:accounts', 'Аккаунты', '👤'),
       btn('m:help', 'Помощь', '❓'),
+    ),
+    new ActionRowBuilder().addComponents(
+      btn('m:settings', 'Настройки', '⚙️'),
+      btn('m:refresh', 'Обновить меню', '🔄'),
     ),
   ];
   return { embeds: [embed], components: rows };
@@ -694,17 +744,19 @@ function updateMenu() {
   }, 1500);
 }
 
+const setPresence = (p) => { try { discord.user?.setPresence(p); } catch (e) { log('Статус:', e.message); } };
+
 // статус бота в Discord + данные для меню (раз в минуту)
 async function refreshStatus() {
   if (!rust) {
-    discord.user?.setPresence({ status: 'idle', activities: [{ name: 'Нет связи с Rust+', type: ActivityType.Watching }] });
+    setPresence({ status: 'idle', activities: [{ name: 'Нет связи с Rust+', type: ActivityType.Watching }] });
     updateMenu();
     return;
   }
   try { serverInfo = (await rust.sendRequestAsync({ getInfo: {} })).info; } catch {}
   try { lastTime = (await rust.sendRequestAsync({ getTime: {} })).time; } catch {}
   if (serverInfo) {
-    discord.user?.setPresence({
+    setPresence({
       status: 'online',
       activities: [{ name: `Rust • ${serverInfo.players}/${serverInfo.maxPlayers}${lastTime ? ` • ${gameClock(lastTime)}` : ''}`, type: ActivityType.Playing }],
     });
@@ -721,7 +773,7 @@ async function runAsCard(i, text, who, { update = false, extraComponents } = {})
     ? { embeds: res.embeds || [], files: res.files }
     : { embeds: [resultCard(text, res)] };
   if (extraComponents) payload.components = extraComponents;
-  if (res.action && cfg.toTeamChat) toTeamChat(`[BOT] ${plain(res.action)}`);
+  if (res.action && S().toTeamChat) toTeamChat(`[BOT] ${plain(res.action)}`);
   if (update) return i.update(payload);
   if (i.deferred || i.replied) return i.editReply(payload);
   return i.reply({ ...payload, flags: MessageFlags.Ephemeral });
@@ -798,7 +850,7 @@ async function handlePanelButton(i, who) {
     }
     if (targets.length > 1) await new Promise((r) => setTimeout(r, 400));
   }
-  if (done.length && cfg.toTeamChat) toTeamChat(`[BOT] ${who}: ${done.join(', ')}`);
+  if (done.length && S().toTeamChat) toTeamChat(`[BOT] ${who}: ${done.join(', ')}`);
 }
 
 const LINK_GUIDE = [
@@ -811,9 +863,70 @@ const LINK_GUIDE = [
   '⚠️ Файл — ключ к твоему Rust+. Только в личку боту!',
 ].join('\n');
 
+// ---------- ⚙️ настройки (только админы сервера) ----------
+const canConfigure = (i) => isAdmin(i.member) || i.guild?.ownerId === i.user.id;
+const onOff = (v) => (v ? '✅' : '❌');
+
+function settingsView() {
+  const st = S();
+  const tog = (key, label, emoji) => new ButtonBuilder().setCustomId(`set:${key}`).setLabel(label).setEmoji(emoji)
+    .setStyle(st[key] ? ButtonStyle.Success : ButtonStyle.Secondary);
+  const evList = Object.entries(settings.EVENT_TYPES).filter(([k]) => st.events.includes(k)).map(([, v]) => v).join(', ') || 'никакие';
+  const embed = card({
+    title: '⚙️ Настройки бота',
+    desc: 'Зелёная кнопка — включено, серая — выключено. Изменения сохраняются сразу.',
+    color: COLOR.info,
+    fields: [
+      { name: '🔔 Уведомления', value: `${onOff(st.notifyDeaths)} Смерти\n${onOff(st.notifyOnline)} Онлайн/оффлайн\n${onOff(st.notifyTeam)} Вход/выход из команды\n${onOff(st.notifyEvents)} Ивенты карты`, inline: true },
+      { name: '💬 Чат', value: `${onOff(st.toTeamChat)} Дублировать в тим-чат\n${onOff(st.bridgeToDiscord)} Тим-чат → Discord\n${onOff(st.bridgeToGame)} Discord → тим-чат\n${onOff(st.alarmPing)} @everyone при аларме`, inline: true },
+      { name: '🗺️ Какие ивенты', value: evList },
+      { name: '🔒 Доступ к боту', value: st.accessRole ? `только роль ${roleLabel()} (и админы)` : '⚠️ **все**, кто видит канал — выбери роль ниже!' },
+    ],
+  });
+  const rows = [
+    new ActionRowBuilder().addComponents(
+      tog('notifyDeaths', 'Смерти', '💀'), tog('notifyOnline', 'Онлайн', '🟢'), tog('notifyTeam', 'Команда', '👥'),
+      tog('notifyEvents', 'Ивенты', '🗺️'), tog('alarmPing', 'Пинг аларм', '🚨'),
+    ),
+    new ActionRowBuilder().addComponents(
+      tog('toTeamChat', 'В тим-чат', '🎮'), tog('bridgeToDiscord', 'Игра → DS', '📥'), tog('bridgeToGame', 'DS → игра', '📤'),
+      new ButtonBuilder().setCustomId('set_role_clear').setLabel('Доступ всем').setEmoji('🔓').setStyle(ButtonStyle.Danger).setDisabled(!st.accessRole),
+    ),
+    new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+      .setCustomId('set_events').setPlaceholder('Какие ивенты присылать…').setMinValues(0).setMaxValues(Object.keys(settings.EVENT_TYPES).length)
+      .addOptions(Object.entries(settings.EVENT_TYPES).map(([k, v]) => ({ label: v.replace(/^\S+\s/, ''), emoji: v.split(' ')[0], value: k, default: st.events.includes(k) })))),
+    new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder()
+      .setCustomId('set_role').setPlaceholder('🔒 Роль с доступом к боту…').setMinValues(1).setMaxValues(1)),
+  ];
+  return { embeds: [embed], components: rows };
+}
+
 discord.on('interactionCreate', async (i) => {
   const who = i.member?.displayName || i.user.username;
+  if (!i.isRepliable()) return;
+  if (!hasAccess(i.member)) return i.reply(eph(card({ desc: NO_ACCESS(), color: COLOR.warn }))).catch(() => {});
+  if (!i.isModalSubmit() && tooFast(i.user.id, 800)) {
+    return i.reply(eph(card({ desc: '⏳ Не так быстро', color: COLOR.muted }))).catch(() => {});
+  }
   try {
+    // --- настройки ---
+    const cid = i.customId || '';
+    if (cid === 'm:settings' || cid.startsWith('set')) {
+      if (!canConfigure(i)) return i.reply(eph(card({ desc: '🔒 Настройки может менять только админ сервера', color: COLOR.warn })));
+      if (cid === 'm:settings') return i.reply({ ...settingsView(), flags: MessageFlags.Ephemeral });
+      if (cid.startsWith('set:')) settings.toggle(cid.slice(4));
+      else if (cid === 'set_events') settings.set({ events: i.values });
+      else if (cid === 'set_role') settings.set({ accessRole: i.values[0] || '' });
+      else if (cid === 'set_role_clear') settings.set({ accessRole: '' });
+      log(`Настройки изменил ${who}: ${cid}`);
+      updateMenu();
+      return i.update(settingsView());
+    }
+    if (cid === 'm:refresh') {
+      await refreshStatus();
+      return i.reply(eph(card({ desc: '🔄 Меню обновлено', color: COLOR.ok })));
+    }
+
     // --- окна ввода ---
     if (i.isModalSubmit()) {
       if (i.customId === 'timer_modal') {
@@ -869,7 +982,7 @@ discord.on('interactionCreate', async (i) => {
       try {
         const v = !(switchState.has(d.id) ? switchState.get(d.id) : await refreshDevice(d));
         await setSwitch(d, v);
-        if (cfg.toTeamChat) toTeamChat(`[BOT] ${who}: ${d.name} ${stateText(v)}`);
+        if (S().toTeamChat) toTeamChat(`[BOT] ${who}: ${d.name} ${stateText(v)}`);
       } catch (e) { return i.reply(eph(card({ desc: `⚠️ ${errText(e)}`, color: COLOR.warn }))); }
       return i.update(deviceCard(dev.get(d.id)));
     }
@@ -967,8 +1080,17 @@ function stopFcm(steamId) {
 async function handleLink(m) {
   const file = m.attachments.first();
   const inGuild = !!m.guild;
-  if (inGuild) m.delete().catch(() => {}); // файл с ключами — убираем из канала
-  const reply = (text) => (inGuild ? m.channel.send(`<@${m.author.id}> ${text}`) : m.reply(text)).catch(() => {});
+  if (inGuild && file) m.delete().catch(() => {}); // файл с ключами — убираем из канала
+  const reply = (text) => (inGuild ? m.channel.send({ content: `<@${m.author.id}>`, embeds: [card({ title: '👤 Аккаунт Rust+', desc: text, color: COLOR.info })] })
+                                   : m.reply({ embeds: [card({ title: '👤 Аккаунт Rust+', desc: text, color: COLOR.info })] })).catch(() => {});
+  if (inGuild && file) reply('⚠️ Файл с ключами нельзя кидать в общий канал — я его удалил. Отправь мне **в личку**.');
+  if (inGuild && file) return;
+
+  if (!channel) return reply('Бот ещё запускается, попробуй через минуту');
+  const member = await memberOf(m.author.id);
+  if (!member) return reply('Ты не участник сервера с ботом');
+  if (!hasAccess(member)) return reply(NO_ACCESS());
+  if (tooFast(m.author.id, 5000)) return reply('⏳ Подожди пару секунд');
   if (!file) {
     return reply([
       'Как добавить свой аккаунт:',
@@ -978,11 +1100,19 @@ async function handleLink(m) {
       '4. Пришли мне **в личку** файл `rust-account.json` с текстом `!link`',
     ].join('\n'));
   }
+  // проверяем вложение: маленький .json с CDN Discord
+  let host = '';
+  try { host = new URL(file.url).hostname; } catch {}
+  if (!/\.json$/i.test(file.name || '') || file.size > 64 * 1024 || !/(^|\.)discord(app)?\.(com|net)$/.test(host)) {
+    return reply('⚠️ Нужен файл **.json** (rust-account.json или rustplus.config.json), не больше 64 КБ');
+  }
   try {
-    const res = await fetch(file.url);
-    const config = JSON.parse(await res.text());
-    const name = m.member?.displayName || m.author.globalName || m.author.username;
-    const r = accounts.put(config, name);
+    const res = await fetch(file.url, { signal: AbortSignal.timeout(10000) });
+    const text = await res.text();
+    if (text.length > 64 * 1024) return reply('⚠️ Файл слишком большой');
+    const config = JSON.parse(text);
+    const name = member.displayName || m.author.globalName || m.author.username;
+    const r = accounts.put(config, name, m.author.id);
     if (r.error) return reply(`⚠️ Не подошёл файл: ${r.error}`);
     runFcm(r.account);
     log(`Добавлен аккаунт ${r.account.name} (${r.account.steamId})`);
@@ -992,7 +1122,8 @@ async function handleLink(m) {
           'Теперь зайди на сервер → Esc → Rust+ → **Pair with server**. После этого можешь привязывать переключатели (E → Pair).');
     toDiscord(`👤 **${r.account.name}** ${r.isNew ? 'добавил' : 'обновил'} свой Rust+ аккаунт`, 0x3498db);
   } catch (e) {
-    reply(`⚠️ Не смог прочитать файл: ${e.message}`);
+    reply('⚠️ Не смог прочитать файл — это точно rust-account.json?');
+    log('!link ошибка:', e.message);
   }
 }
 
@@ -1009,9 +1140,10 @@ async function onTeamMessage(msg) {
   // пропускаем то, что отправил сам бот
   const t = sentEcho.get(text);
   if (t && Date.now() - t < 60000) { sentEcho.delete(text); return; }
-  chatToDiscord(msg.name, text);
+  if (S().bridgeToDiscord) chatToDiscord(msg.name, text);
 
   if (text.startsWith('!')) {
+    if (['unlink', 'link'].includes(cmdKey(text))) return toTeamChat('[BOT] Эта команда только в Discord');
     try {
       const res = await runCommand(text, msg.name);
       if (res) {
@@ -1032,6 +1164,16 @@ discord.on('messageCreate', async (m) => {
     return;
   }
   if (m.channelId !== cfg.channelId || !m.content) return;
+  if (!hasAccess(m.member)) {
+    if (m.content.startsWith('!')) m.reply({ embeds: [card({ desc: NO_ACCESS(), color: COLOR.warn })] }).catch(() => {});
+    return; // сообщения без доступа и в игру не пересылаем
+  }
+  if (m.content.startsWith('!') && tooFast(m.author.id)) return m.react('⏳').catch(() => {});
+  if (cmdKey(m.content) === 'unlink' && !isAdmin(m.member)) {
+    const q = m.content.split(/\s+/).slice(1).join(' ').toLowerCase();
+    const a = accounts.all().find((x) => x.steamId === q || x.name.toLowerCase() === q);
+    if (a && a.discordId !== m.author.id) return m.reply({ embeds: [card({ desc: '🔒 Удалить можно только свой аккаунт (или админ сервера)', color: COLOR.warn })] }).catch(() => {});
+  }
   if (m.content.startsWith('!')) log(`Команда из Discord от ${m.author.username}: ${m.content}`);
   const name = m.member?.displayName || m.author.username;
 
@@ -1045,7 +1187,7 @@ discord.on('messageCreate', async (m) => {
           return;
         }
         await m.reply({ embeds: [resultCard(m.content, res)], allowedMentions: { parse: [] } });
-        if (res.action && cfg.toTeamChat) toTeamChat(`[BOT] ${plain(res.action)}`);
+        if (res.action && S().toTeamChat) toTeamChat(`[BOT] ${plain(res.action)}`);
         return;
       }
     } catch (e) {
@@ -1055,12 +1197,14 @@ discord.on('messageCreate', async (m) => {
   }
 
   if (!rust) return m.react('⚠️').catch(() => {});
-  toTeamChat(`[DS] ${name}: ${m.content.replace(/\s+/g, ' ')}`);
+  if (!S().bridgeToGame) return;
+  toTeamChat(`[DS] ${name}: ${m.content.replace(/\s+/g, ' ').replace(/<@!?&?\d+>/g, '@')}`);
 });
 
 // ---------- подключение к Rust+ ----------
 let currentClient = null;
 // защита от спама при неработающем токене (например, после вайпа)
+let everConnected = false;
 let failStreak = 0;        // сколько раз подряд сервер не отдал данные
 let warnedBadToken = false; // уже предупредили в Discord
 let outageAnnounced = false;
@@ -1076,8 +1220,7 @@ function switchServer(body, who) {
     RUST_PORT: body.port || '',
     name: body.name,
   };
-  fs.mkdirSync(path.dirname(SERVER_FILE), { recursive: true });
-  fs.writeFileSync(SERVER_FILE, JSON.stringify(server, null, 2));
+  store.write(SERVER_FILE, server, { secret: true });
   toDiscord(`🔄 ${who ? `**${who}** привязал` : 'Привязан'} сервер **${body.name}** — переключаюсь на него...`, 0x3498db);
   log(`Переключаюсь на сервер ${body.name} (${body.id})`);
 
@@ -1120,12 +1263,24 @@ function connectRust() {
       const info = await r.sendRequestAsync({ getInfo: {} });
       mapSize = info.info.mapSize;
       serverInfo = info.info;
+      // вайп: время вайпа поменялось → старые устройства больше не существуют
+      const wipe = String(info.info.wipeTime || '');
+      if (wipe && server.wipeTime && server.wipeTime !== wipe) {
+        const n = dev.clear();
+        switchState.clear();
+        mapCache = null;
+        toDiscord(`🧹 На сервере был **вайп** — список устройств очищен${n ? ` (было ${n})` : ''}. Привяжи свитчи заново: E → Pair.`, COLOR.warn);
+      }
+      if (wipe && server.wipeTime !== wipe) { server.wipeTime = wipe; store.write(SERVER_FILE, server, { secret: true }); }
       const ti = await r.sendRequestAsync({ getTeamInfo: {} });
       processTeam(ti.teamInfo, true);
       await pollEvents();
       await subscribeAll();
       updatePanel();
-      toDiscord(`✅ Подключился к **${info.info.name}** — онлайн ${info.info.players}/${info.info.maxPlayers}, в пачке ${team.size} чел., устройств ${dev.all().length}`, 0x2ecc71);
+      if (!everConnected || warnedBadToken || outageAnnounced) {
+        toDiscord(`✅ Подключился к **${info.info.name}** — онлайн ${info.info.players}/${info.info.maxPlayers}, в пачке ${team.size} чел., устройств ${dev.all().length}`, 0x2ecc71);
+      }
+      everConnected = true;
       if (!menuMsgId) await postMenu().catch((e) => log('Меню:', e.message));
       if (warnedBadToken || outageAnnounced) log('Связь с Rust+ восстановлена');
       failStreak = 0; warnedBadToken = false; outageAnnounced = false;
@@ -1194,6 +1349,7 @@ discord.once('clientReady', async () => {
     updateMenu();
   });
   refreshStatus();
+  if (!S().accessRole) log('⚠️ ACCESS_ROLE не задан — ботом может пользоваться любой, кто видит канал. Впиши роль в .env');
   accounts.load();
   for (const a of accounts.all()) runFcm(a);
   if (!accounts.all().length) log('Нет ни одного Rust+ аккаунта — выполни npm run register');

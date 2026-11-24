@@ -2,6 +2,7 @@
 // В каждом: fcm_credentials (чтобы ловить Pair), rustplus_auth_token (чтобы подключаться через relay)
 const fs = require('fs');
 const path = require('path');
+const store = require('./store');
 
 const DIR = path.join(process.cwd(), 'data', 'accounts');
 const accounts = new Map(); // steamId -> {steamId, name, exp, config}
@@ -23,14 +24,15 @@ function validate(config) {
   return null;
 }
 
-function put(config, name) {
+function put(config, name, discordId) {
   const err = validate(config);
   if (err) return { error: err };
   const { steamId, exp } = decodeToken(config.rustplus_auth_token);
   const prev = accounts.get(steamId);
-  const acc = { steamId, exp, name: name || prev?.name || steamId, config };
-  fs.mkdirSync(DIR, { recursive: true });
-  fs.writeFileSync(path.join(DIR, `${steamId}.json`), JSON.stringify({ name: acc.name, ...config }, null, 2));
+  // сохраняем только нужные поля — лишнее из файла не храним
+  config = { fcm_credentials: config.fcm_credentials, expo_push_token: config.expo_push_token, rustplus_auth_token: config.rustplus_auth_token };
+  const acc = { steamId, exp, name: name || prev?.name || steamId, discordId: discordId || prev?.discordId || null, config };
+  store.write(path.join(DIR, `${steamId}.json`), { name: acc.name, discordId: acc.discordId, ...config }, { secret: true });
   accounts.set(steamId, acc);
   return { account: acc, isNew: !prev, changedFcm: prev?.config.fcm_credentials?.gcm?.androidId !== config.fcm_credentials.gcm.androidId };
 }
@@ -40,10 +42,12 @@ function load() {
     for (const f of fs.readdirSync(DIR)) {
       if (!f.endsWith('.json')) continue;
       try {
-        const { name, ...config } = JSON.parse(fs.readFileSync(path.join(DIR, f), 'utf8'));
+        const data = store.read(path.join(DIR, f), null, { secret: true });
+        if (!data) continue;
+        const { name, discordId, ...config } = data;
         if (validate(config)) continue;
         const { steamId, exp } = decodeToken(config.rustplus_auth_token);
-        accounts.set(steamId, { steamId, exp, name: name || steamId, config });
+        accounts.set(steamId, { steamId, exp, name: name || steamId, discordId: discordId || null, config });
       } catch {}
     }
   } catch {}
@@ -62,7 +66,7 @@ function load() {
 function remove(steamId) {
   if (!accounts.has(steamId)) return false;
   accounts.delete(steamId);
-  try { fs.unlinkSync(path.join(DIR, `${steamId}.json`)); } catch {}
+  store.remove(path.join(DIR, `${steamId}.json`));
   return true;
 }
 

@@ -3,3 +3,4 @@ node_modules
 rustplus.config.json
 data/
 rust-account.json
+*.tmp

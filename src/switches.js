@@ -2,6 +2,7 @@
 // { "<entityId>": { "name": "свет", "type": 1 } }   type: 1 = Smart Switch, 2 = Smart Alarm
 const fs = require('fs');
 const path = require('path');
+const store = require('./store');
 
 const DIR = path.join(process.cwd(), 'data');
 const LEGACY = path.join(DIR, 'devices.json');
@@ -16,13 +17,10 @@ function setServer(serverId) {
     fs.mkdirSync(DIR, { recursive: true });
     fs.renameSync(LEGACY, FILE); // старый общий список переносим на текущий сервер
   }
-  try { devices = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { devices = {}; }
+  devices = store.read(FILE, {});
 }
 
-function save() {
-  fs.mkdirSync(path.dirname(FILE), { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(devices, null, 2));
-}
+function save() { store.write(FILE, devices); }
 
 const norm = (s) => String(s || '').trim().toLowerCase();
 
@@ -72,4 +70,6 @@ function remove(name) {
   return d;
 }
 
-module.exports = { setServer, TYPE, all, byType, get, findByName, add, rename, remove };
+function clear() { const n = Object.keys(devices).length; devices = {}; save(); return n; }
+
+module.exports = { clear, setServer, TYPE, all, byType, get, findByName, add, rename, remove };

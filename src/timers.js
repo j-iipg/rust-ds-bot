@@ -1,6 +1,6 @@
 // Таймеры: !timer 10m печь  → через 10 минут напоминание. Сохраняются в data/timers.json (переживают перезапуск)
-const fs = require('fs');
 const path = require('path');
+const store = require('./store');
 
 const FILE = path.join(process.cwd(), 'data', 'timers.json');
 const MAX = 15;
@@ -11,10 +11,7 @@ let nextId = 1;
 const handles = new Map();
 let onFire = () => {};
 
-function save() {
-  fs.mkdirSync(path.dirname(FILE), { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(list, null, 2));
-}
+function save() { store.write(FILE, list); }
 
 // "10m", "1h30m", "90s", "2ч", "15м", "1ч 20мин", "10" (минуты)
 function parseDuration(str) {
@@ -52,7 +49,8 @@ function schedule(t) {
 
 function init(fireCallback) {
   onFire = fireCallback;
-  try { list = JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch { list = []; }
+  list = store.read(FILE, []);
+  if (!Array.isArray(list)) list = [];
   nextId = list.reduce((a, t) => Math.max(a, t.id), 0) + 1;
   list.forEach(schedule); // просроченные за время выключения сработают сразу
 }
