@@ -1060,6 +1060,11 @@ discord.on('messageCreate', async (m) => {
 
 // ---------- подключение к Rust+ ----------
 let currentClient = null;
+// защита от спама при неработающем токене (например, после вайпа)
+let failStreak = 0;        // сколько раз подряд сервер не отдал данные
+let warnedBadToken = false; // уже предупредили в Discord
+let outageAnnounced = false;
+const reconnectDelay = () => Math.min(20000 * 2 ** failStreak, 10 * 60 * 1000); // 20с, 40с, 80с... до 10 мин
 let mapCache = null; // { sid, map } — картинка карты не меняется до вайпа
 
 function switchServer(body, who) {
@@ -1084,6 +1089,7 @@ function switchServer(body, who) {
   team = new Map();
   switchState.clear();
   closePool();
+  failStreak = 0; warnedBadToken = false; outageAnnounced = false;
   if (currentClient) {
     currentClient.switching = true;
     try { currentClient.disconnect(); } catch {}
@@ -1121,9 +1127,20 @@ function connectRust() {
       updatePanel();
       toDiscord(`✅ Подключился к **${info.info.name}** — онлайн ${info.info.players}/${info.info.maxPlayers}, в пачке ${team.size} чел., устройств ${dev.all().length}`, 0x2ecc71);
       if (!menuMsgId) await postMenu().catch((e) => log('Меню:', e.message));
+      if (warnedBadToken || outageAnnounced) log('Связь с Rust+ восстановлена');
+      failStreak = 0; warnedBadToken = false; outageAnnounced = false;
     } catch (e) {
-      log('Ошибка при старте:', e.message || e);
-      toDiscord('⚠️ Подключился, но сервер не отдал данные. Проверь playerToken (мог смениться после вайпа — сделай Pair заново).');
+      failStreak++;
+      log(`Сервер не отдал данные (попытка ${failStreak}):`, errText(e));
+      if (!warnedBadToken) {
+        warnedBadToken = true;
+        toDiscord('⚠️ **Сервер не принимает токен бота** — скорее всего был **вайп**.\n' +
+          'Зайди на сервер → Esc → Rust+ → **Pair with server** (можно с любого привязанного аккаунта) — бот сам подхватит.\n' +
+          `Пока буду тихо пробовать переподключаться (ошибка: \`${errText(e)}\`).`, 0xe67e22);
+      }
+      rust = null;
+      try { r.disconnect(); } catch {}
+      return;
     }
     timers.push(setInterval(pollTeam, cfg.teamPoll));
     timers.push(setInterval(pollEvents, cfg.eventsPoll));
@@ -1144,8 +1161,12 @@ function connectRust() {
   currentClient = r;
   r.on('disconnected', () => {
     if (r.switching) return; // переключаемся на другой сервер — переподключение сделает switchServer
-    if (rust === r) toDiscord('🔌 Отключился от Rust+, переподключаюсь через 20 сек...', 0x95a5a6);
-    log('Rust+ отключён');
+    if (rust === r && !outageAnnounced && !warnedBadToken) {
+      outageAnnounced = true;
+      toDiscord('🔌 Отключился от Rust+, переподключаюсь...', 0x95a5a6);
+    }
+    const delay = reconnectDelay();
+    log(`Rust+ отключён, переподключение через ${Math.round(delay / 1000)} сек`);
     rust = null;
     markers = null;
     closePool();
@@ -1153,7 +1174,7 @@ function connectRust() {
     refreshStatus();
     timers.forEach(clearInterval);
     timers = [];
-    setTimeout(connectRust, 20000);
+    if (!r.stopped) setTimeout(connectRust, delay);
   });
 
   r.connect();
