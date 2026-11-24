@@ -699,7 +699,7 @@ function buildMenu() {
       { name: '🚨 Алармы', value: al.length ? String(al.length) : 'нет', inline: true },
       { name: '⏰ Таймеры', value: String(reminders.all().length), inline: true },
     ],
-  }).setFooter({ text: `${footer().text} • ${S().accessRole ? '🔒 доступ по роли' : '⚠️ доступ открыт всем в канале'}` });
+  }).setFooter({ text: `${footer().text} • ${S().publicButtons ? '🙌 кнопки для всех' : S().accessRole ? '🔒 доступ по роли' : '⚠️ доступ открыт всем'}` });
 
   const rows = [
     new ActionRowBuilder().addComponents(
@@ -880,7 +880,10 @@ function settingsView() {
       { name: '🔔 Уведомления', value: `${onOff(st.notifyDeaths)} Смерти\n${onOff(st.notifyOnline)} Онлайн/оффлайн\n${onOff(st.notifyTeam)} Вход/выход из команды\n${onOff(st.notifyEvents)} Ивенты карты`, inline: true },
       { name: '💬 Чат', value: `${onOff(st.toTeamChat)} Дублировать в тим-чат\n${onOff(st.bridgeToDiscord)} Тим-чат → Discord\n${onOff(st.bridgeToGame)} Discord → тим-чат\n${onOff(st.alarmPing)} @everyone при аларме`, inline: true },
       { name: '🗺️ Какие ивенты', value: evList },
-      { name: '🔒 Доступ к боту', value: st.accessRole ? `только роль ${roleLabel()} (и админы)` : '⚠️ **все**, кто видит канал — выбери роль ниже!' },
+      { name: '🔒 Доступ к боту', value: [
+        st.publicButtons ? '🙌 Обычные кнопки (пульт, карта, время, пачка, таймеры) — **для всех**' : '🔒 Все кнопки — только по роли',
+        st.accessRole ? `🛡️ Удаление/переименование, лидерство, команды и !link — роль ${roleLabel()} и админы` : '⚠️ Роль не выбрана — **всё** доступно всем, кто видит канал. Выбери роль ниже!',
+      ].join('\n') },
     ],
   });
   const rows = [
@@ -889,6 +892,7 @@ function settingsView() {
       tog('notifyEvents', 'Ивенты', '🗺️'), tog('alarmPing', 'Пинг аларм', '🚨'),
     ),
     new ActionRowBuilder().addComponents(
+      tog('publicButtons', 'Кнопки всем', '🙌'),
       tog('toTeamChat', 'В тим-чат', '🎮'), tog('bridgeToDiscord', 'Игра → DS', '📥'), tog('bridgeToGame', 'DS → игра', '📤'),
       new ButtonBuilder().setCustomId('set_role_clear').setLabel('Доступ всем').setEmoji('🔓').setStyle(ButtonStyle.Danger).setDisabled(!st.accessRole),
     ),
@@ -901,10 +905,14 @@ function settingsView() {
   return { embeds: [embed], components: rows };
 }
 
+// кнопки, которые при «Кнопки для всех» доступны любому (без удаления/переименования/лидерства/настроек)
+const PUBLIC_IDS = /^(m:(map|team|time|panel|timer|timers|devices|accounts|linkhelp|help|refresh)|sw:\d+|all:(on|off)|refresh|timer_modal|timer_del|dev_pick|dev_tog:\d+)$/;
+
 discord.on('interactionCreate', async (i) => {
   const who = i.member?.displayName || i.user.username;
   if (!i.isRepliable()) return;
-  if (!hasAccess(i.member)) return i.reply(eph(card({ desc: NO_ACCESS(), color: COLOR.warn }))).catch(() => {});
+  const isPublic = S().publicButtons && PUBLIC_IDS.test(i.customId || '');
+  if (!isPublic && !hasAccess(i.member)) return i.reply(eph(card({ desc: NO_ACCESS(), color: COLOR.warn }))).catch(() => {});
   if (!i.isModalSubmit() && tooFast(i.user.id, 800)) {
     return i.reply(eph(card({ desc: '⏳ Не так быстро', color: COLOR.muted }))).catch(() => {});
   }

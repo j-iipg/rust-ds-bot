@@ -23,6 +23,7 @@ const DEFAULTS = {
   bridgeToGame: true,     // Discord → тим-чат
   alarmPing: true,        // @everyone при срабатывании аларма
   accessRole: (process.env.ACCESS_ROLE || '').trim(), // роль с доступом (ID или название)
+  publicButtons: true,    // обычными кнопками (пульт, карта, время, пачка, таймеры) могут пользоваться все
 };
 
 let data = { ...DEFAULTS, ...store.read(FILE, {}) };
