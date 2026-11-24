@@ -1357,7 +1357,7 @@ discord.once('clientReady', async () => {
     updateMenu();
   });
   refreshStatus();
-  if (!S().accessRole) log('⚠️ ACCESS_ROLE не задан — ботом может пользоваться любой, кто видит канал. Впиши роль в .env');
+  if (!S().accessRole) log('ℹ️ Роль доступа не выбрана — выбери её в Discord: меню → ⚙️ Настройки');
   accounts.load();
   for (const a of accounts.all()) runFcm(a);
   if (!accounts.all().length) log('Нет ни одного Rust+ аккаунта — выполни npm run register');
