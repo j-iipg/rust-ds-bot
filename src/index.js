@@ -7,7 +7,7 @@ const S = () => settings.get();
 store.key(); // создаст DATA_KEY в .env при первом запуске
 const { createRustClient } = require('./relay');
 const { Client, GatewayIntentBits, Partials, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, MessageFlags,
-  ActivityType, PermissionFlagsBits, ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder, RoleSelectMenuBuilder, SlashCommandBuilder } = require('discord.js');
+  ActivityType, PermissionFlagsBits, ModalBuilder, TextInputBuilder, TextInputStyle, StringSelectMenuBuilder, RoleSelectMenuBuilder } = require('discord.js');
 const accounts = require('./accounts');
 
 const { toGrid } = require('./grid');
@@ -16,7 +16,6 @@ const { startFcm } = require('./fcm');
 const { renderMap } = require('./map');
 const reminders = require('./timers');
 const tracker = require('./tracker');
-const events = require('./events');
 
 // ---------- конфиг ----------
 const cfg = {
@@ -29,8 +28,6 @@ const cfg = {
   toTeamChat: (process.env.POST_TO_TEAMCHAT || 'true') === 'true',
   // кто может пользоваться ботом: роль (название или ID). Пусто — все, кто видит канал
   accessRole: (process.env.ACCESS_ROLE || '').trim(),
-  // полный список участников для /войс (нужно включить Server Members Intent в Developer Portal)
-  membersIntent: process.env.MEMBERS_INTENT === 'true',
   teamPoll: Number(process.env.TEAM_POLL_SECONDS || 5) * 1000,
   eventsPoll: Number(process.env.EVENTS_POLL_SECONDS || 10) * 1000,
 };
@@ -80,8 +77,7 @@ const grid = (x, y) => toGrid(x, y, mapSize);
 
 // ---------- Discord ----------
 const discord = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages,
-    GatewayIntentBits.GuildVoiceStates, ...(process.env.MEMBERS_INTENT === 'true' ? [GatewayIntentBits.GuildMembers] : [])],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel], // нужно, чтобы получать личные сообщения (для !link)
 });
 
@@ -811,201 +807,6 @@ async function manualPoll() {
   await trackerTick();
 }
 
-// ---------- 📅 сборы (/vipe) и 🎧 войс ----------
-const EVENT_TZ = process.env.TZ_DISPLAY || 'Asia/Tbilisi';
-const evDraft = new Map(); // userId → последний ввод (чтобы не набирать заново при ошибке)
-const mentionList = (ids) => (ids.length ? ids.map((u) => `<@${u}>`).join('\n') : '—').slice(0, 1024);
-
-function fmtLocal(ts, tz) {
-  const p = Object.fromEntries(new Intl.DateTimeFormat('ru-RU', { timeZone: tz, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })
-    .formatToParts(new Date(ts)).map((x) => [x.type, x.value]));
-  return { date: `${p.day}.${p.month}`, time: `${p.hour}:${p.minute}` };
-}
-
-function eventCard(e) {
-  const now = Date.now();
-  const s = Math.floor(e.start / 1000);
-  let status = `⏳ <t:${s}:R>`;
-  if (now >= e.start && (!e.end || now < e.end)) status = '🔴 **Идёт сейчас**';
-  if (e.end && now >= e.end) status = '✅ Завершён';
-  const embed = new EmbedBuilder()
-    .setColor(now >= e.start ? COLOR.bad : 0xf1c40f)
-    .setTitle(`📅 ${e.title}`.slice(0, 256))
-    .setDescription((e.desc || '').slice(0, 2000) || null)
-    .addFields(
-      { name: '🕒 Время', value: `<t:${s}:F>${e.end ? ` — <t:${Math.floor(e.end / 1000)}:t>` : ''}\n${status}` },
-      { name: `✅ Иду (${e.yes.length}${e.max ? `/${e.max}` : ''})`, value: mentionList(e.yes), inline: true },
-      { name: `❌ Не иду (${e.no.length})`, value: mentionList(e.no), inline: true },
-      { name: `❓ Может быть (${e.maybe.length})`, value: mentionList(e.maybe), inline: true },
-    )
-    .setFooter({ text: `Создал: ${e.createdByName} • время показано в твоём часовом поясе` });
-  const ended = e.end ? now >= e.end : now >= e.start + 6 * 3600000;
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`ev_yes:${e.id}`).setEmoji('✅').setStyle(ButtonStyle.Secondary).setDisabled(ended),
-    new ButtonBuilder().setCustomId(`ev_no:${e.id}`).setEmoji('❌').setStyle(ButtonStyle.Secondary).setDisabled(ended),
-    new ButtonBuilder().setCustomId(`ev_maybe:${e.id}`).setEmoji('❓').setStyle(ButtonStyle.Secondary).setDisabled(ended),
-    new ButtonBuilder().setCustomId(`ev_edit:${e.id}`).setLabel('Изменить').setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`ev_del:${e.id}`).setLabel('Удалить').setStyle(ButtonStyle.Danger),
-  );
-  return { embeds: [embed], components: [row] };
-}
-
-function eventModal(customId, title, v = {}) {
-  const input = (id, label, style, value, placeholder, required, max) => {
-    const t = new TextInputBuilder().setCustomId(id).setLabel(label).setStyle(style).setRequired(required).setMaxLength(max);
-    if (value) t.setValue(String(value).slice(0, max));
-    if (placeholder) t.setPlaceholder(placeholder);
-    return new ActionRowBuilder().addComponents(t);
-  };
-  return new ModalBuilder().setCustomId(customId).setTitle(title).addComponents(
-    input('title', 'Название', TextInputStyle.Short, v.title ?? 'Вайп', 'Вайп / Рейд / Фарм', true, 80),
-    input('when', 'Когда', TextInputStyle.Short, v.when, 'завтра 19:00 · 29.11 19:00-21:00 · пт 20:00 · через 2ч', true, 40),
-    input('desc', 'Описание', TextInputStyle.Paragraph, v.desc, 'Собираемся в войсе, берём кит, не опаздывать!', false, 1000),
-    input('max', 'Сколько мест (пусто — без лимита)', TextInputStyle.Short, v.max, '6', false, 3),
-    input('tz', 'Часовой пояс времени выше', TextInputStyle.Short, v.tz ?? 'Тбилиси', 'Тбилиси · МСК · Киев · +3 · utc+4', false, 40),
-  );
-}
-
-// разобрать окно ввода → данные сбора или ошибка
-function readEventModal(i) {
-  const v = {
-    title: i.fields.getTextInputValue('title').trim() || 'Вайп',
-    when: i.fields.getTextInputValue('when').trim(),
-    desc: i.fields.getTextInputValue('desc').trim(),
-    max: i.fields.getTextInputValue('max').trim(),
-    tz: i.fields.getTextInputValue('tz').trim(),
-  };
-  evDraft.set(i.user.id, v);
-  const tz = events.resolveTz(v.tz, EVENT_TZ);
-  if (!tz) return { error: `Не понял часовой пояс «${v.tz}». Можно: Тбилиси, МСК, Киев, Минск, +3, utc+4` };
-  const when = events.parseWhen(v.when, tz);
-  if (when.error) return { error: when.error };
-  let max = null;
-  if (v.max) { max = parseInt(v.max, 10); if (!(max > 0 && max <= 100)) return { error: 'Мест — число от 1 до 100' }; }
-  return { ev: { title: v.title, desc: v.desc, start: when.start, end: when.end, max, tz } };
-}
-
-const retryRow = (id) => [new ActionRowBuilder().addComponents(btn(id, 'Исправить', '✏️', ButtonStyle.Primary))];
-const canManageEvent = (i, e) => e.createdBy === i.user.id || isAdmin(i.member) || i.guild?.ownerId === i.user.id;
-
-async function eventMessage(e) {
-  try {
-    const ch = await discord.channels.fetch(e.channelId);
-    return { ch, msg: await ch.messages.fetch(e.messageId) };
-  } catch { return { ch: null, msg: null }; }
-}
-
-// кто сейчас в голосовых каналах сервера
-function voiceMap(guild) {
-  const map = new Map(); // userId → voiceState
-  for (const vs of guild.voiceStates.cache.values()) if (vs.channelId) map.set(vs.id, vs);
-  return map;
-}
-
-// раз в 20 сек: напоминание за 15 мин, пинг опоздавших при старте и через 10 мин
-async function eventsTick() {
-  events.cleanup();
-  const now = Date.now();
-  for (const e of events.all()) {
-    const due15 = !e.reminded && now >= e.start - 15 * 60000 && now < e.start;
-    const dueStart = !e.started && now >= e.start && now < e.start + 30 * 60000;
-    const dueLate = e.started && !e.lateRepinged && now >= e.start + 10 * 60000 && now < e.start + 40 * 60000;
-    if (!due15 && !dueStart && !dueLate) {
-      if (!e.started && now >= e.start + 30 * 60000) events.update(e.id, { started: true, lateRepinged: true }); // пропустили (бот был выключен)
-      continue;
-    }
-    const { ch, msg } = await eventMessage(e);
-    if (!ch) { events.update(e.id, { reminded: true, started: true, lateRepinged: true }); continue; }
-    const ping = (ids, text, embed) => ch.send({ content: `${text}${ids.length ? `\n${ids.map((u) => `<@${u}>`).join(' ')}` : ''}`,
-      embeds: embed ? [embed] : [], allowedMentions: { users: ids } }).catch((err) => log('Сбор: не смог отправить:', err.message));
-
-    if (due15) {
-      events.update(e.id, { reminded: true });
-      const ids = [...e.yes, ...e.maybe];
-      if (e.start - e.createdAt > 16 * 60000 && ids.length) {
-        await ping(ids, `⏰ **${e.title}** начинается <t:${Math.floor(e.start / 1000)}:R>! Заходите в войс 🎧`);
-      }
-    }
-    if (dueStart || dueLate) {
-      const inVoice = voiceMap(ch.guild);
-      const late = e.yes.filter((u) => !inVoice.has(u));
-      const here = e.yes.filter((u) => inVoice.has(u));
-      if (dueStart) {
-        events.update(e.id, { started: true, reminded: true });
-        const embed = card({
-          title: `🚨 ${e.title} — начинаем!`,
-          desc: e.yes.length ? '' : 'Никто не записался ✅',
-          color: COLOR.bad,
-          fields: e.yes.length ? [
-            { name: `🎧 В войсе (${here.length})`, value: mentionList(here), inline: true },
-            { name: `⏰ Опаздывают (${late.length})`, value: mentionList(late), inline: true },
-          ] : [],
-        });
-        await ping(late, late.length ? '🚨 **Время!** Вас ждут в войсе — вы опаздываете:' : '✅ Все записавшиеся в войсе — погнали!', embed);
-      } else {
-        events.update(e.id, { lateRepinged: true });
-        if (late.length) await ping(late, `😤 Прошло 10 минут, а вас всё ещё нет в войсе — **${e.title}** уже идёт!`);
-      }
-    }
-    if (msg) msg.edit(eventCard(events.get(e.id))).catch(() => {});
-  }
-}
-
-async function voiceReport(i) {
-  const guild = i.guild;
-  const inVoice = voiceMap(guild);
-  // по каналам
-  const byChannel = new Map();
-  for (const vs of inVoice.values()) {
-    if (!byChannel.has(vs.channelId)) byChannel.set(vs.channelId, []);
-    byChannel.get(vs.channelId).push(vs);
-  }
-  const fields = [...byChannel].slice(0, 20).map(([cid, list]) => ({
-    name: `🔊 ${guild.channels.cache.get(cid)?.name || 'канал'} (${list.length})`.slice(0, 256),
-    value: list.map((vs) => `<@${vs.id}>${vs.selfDeaf || vs.serverDeaf ? ' 🎧❌' : vs.selfMute || vs.serverMute ? ' 🔇' : ''}${vs.streaming ? ' 📺' : ''}`).join('\n').slice(0, 1024),
-    inline: true,
-  }));
-
-  // кто не в войсе: роль из опции → роль доступа → записавшиеся на ближайший сбор
-  let role = i.options.getRole('роль');
-  if (!role && /^\d{15,}$/.test(S().accessRole)) role = guild.roles.cache.get(S().accessRole) || null;
-  let notIn = [], whoLabel = '', note = '';
-  if (role) {
-    if (cfg.membersIntent) { try { await guild.members.fetch(); } catch (e) { note = '⚠️ Не смог загрузить участников — включи **Server Members Intent**.'; } }
-    else note = '_Список роли может быть неполным: для полного включи **Server Members Intent** и `MEMBERS_INTENT=true` в .env_';
-    notIn = [...role.members.values()].filter((m) => !m.user.bot && !inVoice.has(m.id)).map((m) => m.id);
-    whoLabel = `с ролью ${role}`;
-  }
-  const next = events.all().filter((e) => e.guildId === guild.id && e.start > Date.now() - 3 * 3600000).sort((a, b) => a.start - b.start)[0];
-  if (next) {
-    const lateEv = next.yes.filter((u) => !inVoice.has(u));
-    fields.push({ name: `📅 ${next.title} (<t:${Math.floor(next.start / 1000)}:R>) — записались, но не в войсе (${lateEv.length})`.slice(0, 256), value: mentionList(lateEv) });
-  }
-  if (role) fields.push({ name: `❌ Не в войсе — ${role.name} (${notIn.length})`.slice(0, 256), value: mentionList(notIn) });
-
-  const embed = card({
-    title: `🎧 Войс — ${inVoice.size} чел.`,
-    desc: [inVoice.size ? '' : 'В голосовых каналах никого нет 😴', !role && !next ? 'Чтобы видеть, кого **нет** в войсе: `/войс роль:@Пачка` или выбери роль доступа в ⚙️ Настройках.' : '', note].filter(Boolean).join('\n'),
-    color: COLOR.info, fields,
-  });
-  return i.reply({ embeds: [embed], allowedMentions: { parse: [] } });
-}
-
-async function registerSlash() {
-  const cmds = [
-    new SlashCommandBuilder().setName('vipe').setDescription('Создать сбор (вайп, рейд…) с записью ✅ ❌ ❓ и пингом опоздавших'),
-    new SlashCommandBuilder().setName('войс').setDescription('Кто в голосовых каналах, а кто нет')
-      .addRoleOption((o) => o.setName('роль').setDescription('Чью роль проверить (по умолчанию — роль доступа бота)').setRequired(false)),
-    new SlashCommandBuilder().setName('меню').setDescription('Главное меню Rust Bot с кнопками'),
-  ];
-  try {
-    await channel.guild.commands.set(cmds.map((c) => c.toJSON()));
-    log('Слэш-команды: /vipe, /войс, /меню');
-  } catch (e) {
-    log('Слэш-команды не зарегистрированы:', e.message, '— переприглашай бота со scope applications.commands');
-  }
-}
-
 // ---------- статус связи: одно сообщение на проблему + кнопка «Понял» ----------
 const STATUS_FILE = path.join(store.DATA, 'status.json');
 let statusState = { ack: false, incidentId: null, ...store.read(STATUS_FILE, {}) };
@@ -1294,8 +1095,7 @@ const PUBLIC_IDS = /^(m:(map|team|time|panel|timer|timers|devices|accounts|linkh
 discord.on('interactionCreate', async (i) => {
   const who = i.member?.displayName || i.user.username;
   if (!i.isRepliable()) return;
-  // сборы и слэш-команды — для всех (права на изменение сбора проверяются отдельно)
-  const isPublic = i.customId === 'st_ack' || i.isChatInputCommand() || /^ev_/.test(i.customId || '') || (S().publicButtons && PUBLIC_IDS.test(i.customId || ''));
+  const isPublic = i.customId === 'st_ack' || (S().publicButtons && PUBLIC_IDS.test(i.customId || ''));
   if (!isPublic && !hasAccess(i.member)) return i.reply(eph(card({ desc: NO_ACCESS(), color: COLOR.warn }))).catch(() => {});
   if (!i.isModalSubmit() && tooFast(i.user.id, 800)) {
     return i.reply(eph(card({ desc: '⏳ Не так быстро', color: COLOR.muted }))).catch(() => {});
@@ -1307,74 +1107,6 @@ discord.on('interactionCreate', async (i) => {
       log(`Статус: ${who} нажал «Понял»`);
       return i.update({ embeds: [card({ desc: `👍 **${who}** понял — молчу о проблемах со связью, пока она не вернётся. Состояние видно в 🏠 меню.`, color: COLOR.muted, author: 'СТАТУС' })], components: [] });
     }
-    // --- слэш-команды ---
-    if (i.isChatInputCommand()) {
-      if (i.commandName === 'vipe') return i.showModal(eventModal('ev_modal', '📅 Новый сбор', evDraft.get(i.user.id)));
-      if (i.commandName === 'войс') return voiceReport(i);
-      if (i.commandName === 'меню') {
-        if (i.channelId !== cfg.channelId) return i.reply(eph(card({ desc: `🏠 Меню живёт в <#${cfg.channelId}>`, color: COLOR.info })));
-        await postMenu();
-        return i.reply(eph(card({ desc: '🏠 Меню обновлено ⬇️', color: COLOR.ok })));
-      }
-      return;
-    }
-
-    // --- 📅 сборы ---
-    if (cid.startsWith('ev_')) {
-      if (cid === 'ev_modal') {
-        const r = readEventModal(i);
-        if (r.error) return i.reply(eph(card({ desc: `⚠️ ${r.error}`, color: COLOR.warn }), { components: retryRow('ev_retry') }));
-        const e = events.create({ ...r.ev, guildId: i.guildId, channelId: i.channelId, createdBy: i.user.id, createdByName: who });
-        let msg;
-        try { msg = await i.channel.send(eventCard(e)); } catch (err) {
-          events.remove(e.id);
-          return i.reply(eph(card({ desc: '⚠️ Не могу писать в этот канал — дай боту права «Отправлять сообщения» и «Встраивать ссылки»', color: COLOR.warn })));
-        }
-        events.update(e.id, { messageId: msg.id });
-        evDraft.delete(i.user.id);
-        log(`Сбор #${e.id} «${e.title}» создал ${who}`);
-        return i.reply(eph(card({ desc: `✅ Сбор **${e.title}** создан — <t:${Math.floor(e.start / 1000)}:F>`, color: COLOR.ok })));
-      }
-      if (cid === 'ev_retry') return i.showModal(eventModal('ev_modal', '📅 Новый сбор', evDraft.get(i.user.id)));
-
-      const [kind, idStr] = cid.split(':');
-      const e = events.get(idStr);
-      if (!e) return i.reply(eph(card({ desc: 'Этот сбор уже удалён', color: COLOR.muted })));
-
-      if (kind === 'ev_yes' || kind === 'ev_no' || kind === 'ev_maybe') {
-        const r = events.vote(e.id, i.user.id, kind.slice(3));
-        if (r.error) return i.reply(eph(card({ desc: `⚠️ ${r.error}`, color: COLOR.warn })));
-        return i.update(eventCard(r.event));
-      }
-      if (kind === 'ev_edit' || kind === 'ev_del' || kind === 'ev_retry_edit') {
-        if (!canManageEvent(i, e)) return i.reply(eph(card({ desc: '🔒 Изменить или удалить сбор может только его создатель или админ', color: COLOR.warn })));
-        if (kind === 'ev_del') {
-          events.remove(e.id);
-          log(`Сбор #${e.id} удалил ${who}`);
-          return i.message.delete().catch(() => i.update({ embeds: [card({ desc: '🗑️ Сбор удалён', color: COLOR.muted })], components: [] }));
-        }
-        const loc = fmtLocal(e.start, e.tz), locEnd = e.end ? fmtLocal(e.end, e.tz) : null;
-        const tzName = Object.entries(events.TZ_ALIASES).find(([, v]) => v === e.tz)?.[0] || e.tz;
-        return i.showModal(eventModal(`ev_edit_modal:${e.id}`, '✏️ Изменить сбор', evDraft.get(`${i.user.id}:${e.id}`) || {
-          title: e.title, desc: e.desc, max: e.max || '', tz: tzName,
-          when: `${loc.date} ${loc.time}${locEnd ? `-${locEnd.time}` : ''}`,
-        }));
-      }
-      if (kind === 'ev_edit_modal') {
-        if (!canManageEvent(i, e)) return i.reply(eph(card({ desc: '🔒 Нет прав', color: COLOR.warn })));
-        const r = readEventModal(i);
-        if (r.error) {
-          evDraft.set(`${i.user.id}:${e.id}`, evDraft.get(i.user.id));
-          return i.reply(eph(card({ desc: `⚠️ ${r.error}`, color: COLOR.warn }), { components: retryRow(`ev_retry_edit:${e.id}`) }));
-        }
-        evDraft.delete(`${i.user.id}:${e.id}`);
-        const timeChanged = r.ev.start !== e.start;
-        const updated = events.update(e.id, { ...r.ev, ...(timeChanged ? { reminded: false, started: false, lateRepinged: false } : {}) });
-        return i.update(eventCard(updated));
-      }
-      return;
-    }
-
     // --- настройки ---
     if (cid === 'm:settings' || cid.startsWith('set')) {
       if (!canConfigure(i)) return i.reply(eph(card({ desc: '🔒 Настройки может менять только админ сервера', color: COLOR.warn })));
@@ -1905,8 +1637,8 @@ discord.once('clientReady', async () => {
   });
   refreshStatus();
   setInterval(trackerTick, 60000);
-  registerSlash();
-  setInterval(() => eventsTick().catch((e) => log('Сборы:', e.message)), 20000);
+  // убрать старые слэш-команды (/vipe, /войс, /меню), если они остались в Discord
+  channel.guild?.commands.set([]).then(() => log('Слэш-команды удалены')).catch(() => {});
   setTimeout(trackerTick, 5000);
   if (!S().accessRole) log('ℹ️ Роль доступа не выбрана — выбери её в Discord: меню → ⚙️ Настройки');
   accounts.load();
