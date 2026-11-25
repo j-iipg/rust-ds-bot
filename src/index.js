@@ -15,6 +15,7 @@ const dev = require('./switches');
 const { startFcm } = require('./fcm');
 const { renderMap } = require('./map');
 const reminders = require('./timers');
+const tracker = require('./tracker');
 
 // ---------- конфиг ----------
 const cfg = {
@@ -124,7 +125,7 @@ function card({ title, desc, color = COLOR.info, author, fields, image } = {}) {
 // подпись-категория по первому эмодзи сообщения
 const CATEGORY = [
   [/^💀/, 'СМЕРТЬ'], [/^(🟢|⚫)/, 'ОНЛАЙН'], [/^(➕|➖)/, 'КОМАНДА'], [/^(🚢|🚁|📦|💥)/, 'ИВЕНТ НА КАРТЕ'],
-  [/^🚨/, 'ТРЕВОГА'], [/^⏰/, 'ТАЙМЕР'], [/^🔗/, 'ПРИВЯЗКА'], [/^👤/, 'АККАУНТЫ'], [/^(✅|🔌|🔄)/, 'СТАТУС'], [/^⚠️/, 'ВНИМАНИЕ'],
+  [/^🚨/, 'ТРЕВОГА'], [/^🎯/, 'СЛЕЖКА'], [/^⏰/, 'ТАЙМЕР'], [/^🔗/, 'ПРИВЯЗКА'], [/^👤/, 'АККАУНТЫ'], [/^(✅|🔌|🔄)/, 'СТАТУС'], [/^⚠️/, 'ВНИМАНИЕ'],
 ];
 
 async function toDiscord(text, color) {
@@ -170,6 +171,7 @@ function allowed(text) {
   if (/^💀/.test(text)) return st.notifyDeaths;
   if (/^(🟢|⚫)/.test(text)) return st.notifyOnline;
   if (/^(➕|➖)/.test(text)) return st.notifyTeam;
+  if (/^🎯/.test(text)) return st.notifyTracker;
   if (/^(🚢|🚁|📦|💥)/.test(text)) {
     if (!st.notifyEvents) return false;
     const kind = /^🚢/.test(text) ? 'cargo' : /Чинук/.test(text) ? 'ch47' : /^🚁/.test(text) ? 'heli' : /^📦/.test(text) ? 'crate' : 'explosion';
@@ -391,6 +393,7 @@ function onPairing(body, account) {
 }
 
 const HELP = [
+  '!track ник G12 — следить за врагом (зашёл/вышел), !tracked — список, !untrack ник',
   '!menu — главное меню с кнопками в Discord',
   '!map — карта с пачкой и ивентами',
   '!time — время в игре, сколько до ночи/утра',
@@ -551,6 +554,30 @@ async function runCommand(text, who) {
       return { lines: list.map((t) => `⏰ #${t.id} ${t.name} — через ${reminders.fmtLeft(t.at - Date.now())} (${t.who})`) };
     }
 
+    case 'track': case 'следить': {
+      if (!args.length) return { lines: ['Пример: !track PronеKing G12  ·  !tracked — список  ·  !untrack ник'] };
+      if (!currentBm()) await autoDetectBm();
+      const maybeBase = args.length > 1 && /^[a-zа-я]{1,2}\d{1,2}$/i.test(args[args.length - 1]) ? args.pop() : '';
+      const r = tracker.add({ name: args.join(' '), base: maybeBase, bmServerId: currentBm(), addedBy: who });
+      if (r.error) return { lines: [`⚠️ ${r.error}`] };
+      updateMenu();
+      return { lines: [`🎯 Слежу за ${r.target.name}${r.target.base ? ` (база ${r.target.base})` : ''} — напишу, когда зайдёт/выйдет`] };
+    }
+
+    case 'untrack': case 'неследить': {
+      const t = tracker.findByName(args.join(' '));
+      if (!t) return { lines: ['Не нашёл такого в слежке. Список: !tracked'] };
+      tracker.remove(t.id);
+      updateMenu();
+      return { lines: [`🗑️ Больше не слежу за ${t.name}`] };
+    }
+
+    case 'tracked': case 'враги': {
+      const list = tracker.all();
+      if (!list.length) return { lines: ['Слежка пустая. Добавить: !track ник G12'] };
+      return { lines: list.map((t) => `${t.online ? '🟢' : t.online === false ? '🔴' : '⚪'} ${t.name}${t.base ? ` [${t.base}]` : ''} — ${t.online === null ? '?' : `${t.online ? 'онлайн' : 'оффлайн'} ${tracker.fmtDur(Date.now() - t.since)}`}`) };
+    }
+
     case 'accounts': case 'аккаунты': {
       const list = accounts.all();
       if (!list.length) return { lines: ['Нет аккаунтов'] };
@@ -589,12 +616,12 @@ async function runCommand(text, who) {
 const CMD_TITLE = {
   help: '❓ Помощь', sw: '🎛️ Устройства', on: '🎛️ Переключатели', off: '🎛️ Переключатели', t: '🎛️ Переключатели', toggle: '🎛️ Переключатели',
   team: '👥 Пачка', leader: '👑 Лидер', time: '🕒 Время в игре', timer: '⏰ Таймер', timers: '⏰ Таймеры',
-  accounts: '👤 Аккаунты', unlink: '👤 Аккаунты', name: '✏️ Переименование', del: '🗑️ Удаление', map: '🗺️ Карта',
+  track: '🎯 Слежка', untrack: '🎯 Слежка', tracked: '🎯 Слежка', accounts: '👤 Аккаунты', unlink: '👤 Аккаунты', name: '✏️ Переименование', del: '🗑️ Удаление', map: '🗺️ Карта',
 };
 const cmdKey = (text) => (text.slice(1).trim().split(/\s+/)[0] || '').toLowerCase();
 const resultCard = (text, res) => card({ title: res.title || CMD_TITLE[cmdKey(text)], desc: res.lines.join('\n'), color: res.color || COLOR.info });
 
-const plain = (s) => s.replace(/[🟢🔴⚫👑🚨⚠️✏️🗑️⏰☀️🌙🗺️]/gu, '').replace(/\s+/g, ' ').trim();
+const plain = (s) => s.replace(/[🟢🔴⚫⚪👑🚨⚠️✏️🗑️⏰☀️🌙🗺️🎯]/gu, '').replace(/\s+/g, ' ').trim();
 
 
 // ---------- пульт с кнопками ----------
@@ -667,6 +694,119 @@ function updatePanel() {
   }, 800);
 }
 
+// ---------- 🎯 слежка за игроками (BattleMetrics) ----------
+const rustKey = () => server.RUST_SERVER_ID || (server.RUST_IP ? `${server.RUST_IP}_${server.RUST_PORT}` : 'default');
+const currentBm = () => tracker.serverFor(rustKey());
+const trkErrAt = new Map();
+
+async function trackerTick() {
+  if (!tracker.all().length) return;
+  let events;
+  try { events = await tracker.poll(); } catch (e) { return log('Слежка:', e.message); }
+  for (const ev of events) {
+    if (ev.error) {
+      // ошибку по серверу пишем в лог не чаще раза в 10 минут
+      if (Date.now() - (trkErrAt.get(ev.bmServerId) || 0) > 600000) { trkErrAt.set(ev.bmServerId, Date.now()); log('Слежка:', ev.error); }
+      continue;
+    }
+    const t = ev.target;
+    if (ev.type === 'first') continue;
+    const base = t.base ? ` • 🏠 база **${t.base}**` : '';
+    const other = t.bmServerId !== currentBm() ? ` (${tracker.serverName(t.bmServerId)})` : '';
+    const note = t.note ? `\n📝 ${t.note}` : '';
+    if (ev.type === 'online') {
+      notify(`🎯 🟢 **${t.name}** зашёл на сервер${other}${base}\nБыл оффлайн ${tracker.fmtDur(ev.duration)}${note}`,
+             `[BOT] Враг ${t.name} ЗАШЁЛ${t.base ? ` (база ${t.base})` : ''}`, COLOR.ok);
+    } else {
+      notify(`🎯 🔴 **${t.name}** вышел с сервера${other}${base}\nИграл ${tracker.fmtDur(ev.duration)}${note}`,
+             `[BOT] Враг ${t.name} ВЫШЕЛ${t.base ? ` (база ${t.base})` : ''}`, COLOR.bad);
+    }
+  }
+  if (events.some((e) => e.type)) updateMenu();
+}
+
+// найти текущий сервер Rust+ на BattleMetrics по названию
+async function autoDetectBm() {
+  if (currentBm() || !serverInfo?.name) return;
+  try {
+    const s = await tracker.autoDetect(serverInfo.name, serverInfo.players || 0);
+    if (s) {
+      tracker.setServerFor(rustKey(), s.id, s.name);
+      log(`Слежка: сервер на BattleMetrics — ${s.name} (#${s.id})`);
+    }
+  } catch (e) { log('Слежка: не смог найти сервер на BattleMetrics:', e.message); }
+}
+
+function targetLine(t) {
+  const st = t.online === null ? '⚪' : t.online ? '🟢' : '🔴';
+  const dur = t.online === null ? 'проверяю…' : t.online ? `онлайн ${tracker.fmtDur(Date.now() - t.since)}` : `оффлайн ${tracker.fmtDur(Date.now() - t.since)}`;
+  return `${st} **${t.name}** — ${dur}${t.base ? ` • 🏠 ${t.base}` : ''}`;
+}
+
+function trackerView(note) {
+  const bmId = currentBm();
+  const groups = new Map();
+  for (const t of tracker.all()) { if (!groups.has(t.bmServerId)) groups.set(t.bmServerId, []); groups.get(t.bmServerId).push(t); }
+  const fields = [...groups].map(([sid, list]) => ({
+    name: `🌍 ${tracker.serverName(sid)}${sid === bmId ? ' (текущий)' : ''}`.slice(0, 256),
+    value: list.map(targetLine).join('\n').slice(0, 1024),
+  }));
+  const embed = card({
+    title: '🎯 Слежка за игроками',
+    desc: [
+      note,
+      `Сервер для новых целей: **${bmId ? tracker.serverName(bmId) : '— не выбран'}**`,
+      tracker.all().length ? '' : 'Список пуст. Нажми **➕ Добавить** и впиши ник врага.',
+      '_Видно только онлайн/оффлайн (BattleMetrics), не позицию. Проверка раз в минуту._',
+    ].filter(Boolean).join('\n'),
+    color: COLOR.bad, fields,
+  });
+  const rows = [new ActionRowBuilder().addComponents(
+    btn('trk_add', 'Добавить', '➕', ButtonStyle.Success),
+    btn('trk_srv', 'Сервер', '🌍'),
+    btn('trk_refresh', 'Обновить', '🔄'),
+  )];
+  if (tracker.all().length) rows.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+    .setCustomId('trk_pick').setPlaceholder('Подробнее / удалить…')
+    .addOptions(tracker.all().slice(0, 25).map((t) => ({
+      label: t.name.slice(0, 100), value: String(t.id),
+      emoji: t.online === null ? '⚪' : t.online ? '🟢' : '🔴',
+      description: `${tracker.serverName(t.bmServerId)}`.slice(0, 100),
+    })))));
+  return { embeds: [embed], components: rows };
+}
+
+function targetCard(t) {
+  const s = tracker.stats(t);
+  const lastSeen = t.lastSeen ? `<t:${Math.floor(t.lastSeen / 1000)}:R>` : 'ещё не видел';
+  const embed = card({
+    title: `🎯 ${t.name}`,
+    desc: targetLine(t),
+    color: t.online ? COLOR.ok : COLOR.bad,
+    fields: [
+      { name: '🏠 База', value: t.base || '—', inline: true },
+      { name: '👁️ Последний раз в игре', value: t.online ? 'сейчас' : lastSeen, inline: true },
+      { name: '⏱️ За сутки онлайн', value: tracker.fmtDur(s.today), inline: true },
+      { name: '😴 Обычно оффлайн', value: s.quiet ? `${s.quiet} (${tracker.TZ})` : 'нужно ~сутки наблюдений', inline: true },
+      { name: '🌍 Сервер', value: tracker.serverName(t.bmServerId), inline: true },
+      { name: '📝 Заметка', value: t.note || '—', inline: true },
+      { name: `📊 Онлайн по часам (7 дней, ${tracker.TZ})`, value: '```\n' + s.graph + '\n0     6     12    18   23\n```' },
+    ],
+  });
+  return { embeds: [embed], components: [new ActionRowBuilder().addComponents(
+    btn(`trk_base:${t.id}`, 'База / заметка', '🏠'),
+    btn(`trk_del:${t.id}`, 'Удалить', '🗑️', ButtonStyle.Danger),
+    btn('trk_back', 'Назад', '⬅️'),
+  )] };
+}
+
+let lastManualPoll = 0;
+async function manualPoll() {
+  if (Date.now() - lastManualPoll < 10000) return; // не чаще раза в 10 сек
+  lastManualPoll = Date.now();
+  await trackerTick();
+}
+
 // ---------- главное меню (дашборд с кнопками) ----------
 const MENU_FILE = path.join(process.cwd(), 'data', 'menu.json');
 let menuMsgId = null;
@@ -698,6 +838,7 @@ function buildMenu() {
       { name: '🎛️ Переключатели', value: sw.length ? `${swOn} вкл / ${sw.length}` : 'нет', inline: true },
       { name: '🚨 Алармы', value: al.length ? String(al.length) : 'нет', inline: true },
       { name: '⏰ Таймеры', value: String(reminders.all().length), inline: true },
+      { name: '🎯 Слежка', value: tracker.all().length ? `${tracker.all().filter((t) => t.online).length} онлайн / ${tracker.all().length}` : 'нет целей', inline: true },
     ],
   }).setFooter({ text: `${footer().text} • ${S().publicButtons ? '🙌 кнопки для всех' : S().accessRole ? '🔒 доступ по роли' : '⚠️ доступ открыт всем'}` });
 
@@ -716,6 +857,7 @@ function buildMenu() {
       btn('m:help', 'Помощь', '❓'),
     ),
     new ActionRowBuilder().addComponents(
+      btn('m:tracker', 'Слежка', '🎯', ButtonStyle.Danger),
       btn('m:settings', 'Настройки', '⚙️'),
       btn('m:refresh', 'Обновить меню', '🔄'),
     ),
@@ -878,7 +1020,7 @@ function settingsView() {
     color: COLOR.info,
     fields: [
       { name: '🔔 Уведомления', value: `${onOff(st.notifyDeaths)} Смерти\n${onOff(st.notifyOnline)} Онлайн/оффлайн\n${onOff(st.notifyTeam)} Вход/выход из команды\n${onOff(st.notifyEvents)} Ивенты карты`, inline: true },
-      { name: '💬 Чат', value: `${onOff(st.toTeamChat)} Дублировать в тим-чат\n${onOff(st.bridgeToDiscord)} Тим-чат → Discord\n${onOff(st.bridgeToGame)} Discord → тим-чат\n${onOff(st.alarmPing)} @everyone при аларме`, inline: true },
+      { name: '💬 Чат', value: `${onOff(st.toTeamChat)} Дублировать в тим-чат\n${onOff(st.bridgeToDiscord)} Тим-чат → Discord\n${onOff(st.bridgeToGame)} Discord → тим-чат\n${onOff(st.alarmPing)} @everyone при аларме\n${onOff(st.notifyTracker)} Слежка: зашёл/вышел`, inline: true },
       { name: '🗺️ Какие ивенты', value: evList },
       { name: '🔒 Доступ к боту', value: [
         st.publicButtons ? '🙌 Обычные кнопки (пульт, карта, время, пачка, таймеры) — **для всех**' : '🔒 Все кнопки — только по роли',
@@ -899,6 +1041,7 @@ function settingsView() {
     new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
       .setCustomId('set_events').setPlaceholder('Какие ивенты присылать…').setMinValues(0).setMaxValues(Object.keys(settings.EVENT_TYPES).length)
       .addOptions(Object.entries(settings.EVENT_TYPES).map(([k, v]) => ({ label: v.replace(/^\S+\s/, ''), emoji: v.split(' ')[0], value: k, default: st.events.includes(k) })))),
+    new ActionRowBuilder().addComponents(tog('notifyTracker', 'Слежка: уведомления', '🎯')),
     new ActionRowBuilder().addComponents(new RoleSelectMenuBuilder()
       .setCustomId('set_role').setPlaceholder('🔒 Роль с доступом к боту…').setMinValues(1).setMaxValues(1)),
   ];
@@ -906,7 +1049,7 @@ function settingsView() {
 }
 
 // кнопки, которые при «Кнопки для всех» доступны любому (без удаления/переименования/лидерства/настроек)
-const PUBLIC_IDS = /^(m:(map|team|time|panel|timer|timers|devices|accounts|linkhelp|help|refresh)|sw:\d+|all:(on|off)|refresh|timer_modal|timer_del|dev_pick|dev_tog:\d+)$/;
+const PUBLIC_IDS = /^(m:(map|team|time|panel|timer|timers|devices|accounts|linkhelp|help|refresh)|sw:\d+|all:(on|off)|refresh|timer_modal|timer_del|dev_pick|dev_tog:\d+|m:tracker|trk_(add|add_modal|srv|srv_modal|srv_pick|refresh|pick|back)|trk_(del|base|base_modal):\d+)$/;
 
 discord.on('interactionCreate', async (i) => {
   const who = i.member?.displayName || i.user.username;
@@ -930,6 +1073,94 @@ discord.on('interactionCreate', async (i) => {
       updateMenu();
       return i.update(settingsView());
     }
+    // --- 🎯 слежка ---
+    if (cid === 'm:tracker' || cid.startsWith('trk_')) {
+      const respond = (payload) => ((i.isModalSubmit() ? i.isFromMessage() : i.isMessageComponent()) && cid !== 'm:tracker'
+        ? i.update(payload) : i.reply({ ...payload, flags: MessageFlags.Ephemeral }));
+      if (cid === 'm:tracker' || cid === 'trk_back') return respond(trackerView());
+      if (cid === 'trk_refresh') { await i.deferUpdate(); await manualPoll(); return i.editReply(trackerView('🔄 Обновлено')); }
+      if (cid === 'trk_add') {
+        return i.showModal(new ModalBuilder().setCustomId('trk_add_modal').setTitle('🎯 Следить за игроком').addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('name').setLabel('Ник игрока (как на сервере)')
+            .setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(64)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('base').setLabel('Квадрат его базы (необязательно)')
+            .setStyle(TextInputStyle.Short).setPlaceholder('G12').setRequired(false).setMaxLength(8)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('note').setLabel('Заметка (необязательно)')
+            .setStyle(TextInputStyle.Short).setPlaceholder('2x2 каменка, 3 человека').setRequired(false).setMaxLength(100)),
+        ));
+      }
+      if (cid === 'trk_add_modal') {
+        if (!currentBm()) await autoDetectBm();
+        const r = tracker.add({
+          name: i.fields.getTextInputValue('name'), base: i.fields.getTextInputValue('base'),
+          note: i.fields.getTextInputValue('note'), bmServerId: currentBm(), addedBy: who,
+        });
+        if (r.error) return respond(trackerView(`⚠️ ${r.error}`));
+        if (i.isFromMessage()) await i.deferUpdate(); else await i.deferReply({ flags: MessageFlags.Ephemeral });
+        try { await tracker.poll(); } catch {}
+        const t = tracker.get(r.target.id);
+        const status = t.online === null ? 'проверю в течение минуты' : t.online ? 'сейчас **онлайн** 🟢' : 'сейчас **оффлайн** 🔴 (или ник написан не так, как на сервере)';
+        log(`Слежка: ${who} добавил ${t.name}`);
+        updateMenu();
+        return i.editReply(trackerView(`✅ Слежу за **${t.name}** — ${status}`));
+      }
+      if (cid === 'trk_pick') {
+        const t = tracker.get(i.values[0]);
+        return i.update(t ? targetCard(t) : trackerView('Игрок уже удалён'));
+      }
+      if (cid.startsWith('trk_del:')) {
+        const t = tracker.remove(cid.split(':')[1]);
+        updateMenu();
+        return i.update(trackerView(t ? `🗑️ **${t.name}** убран из слежки` : 'Уже удалён'));
+      }
+      if (cid.startsWith('trk_base:')) {
+        const t = tracker.get(cid.split(':')[1]);
+        if (!t) return i.update(trackerView('Игрок уже удалён'));
+        return i.showModal(new ModalBuilder().setCustomId(`trk_base_modal:${t.id}`).setTitle(`🏠 ${t.name}`.slice(0, 45)).addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('base').setLabel('Квадрат базы')
+            .setStyle(TextInputStyle.Short).setValue(t.base || '').setRequired(false).setMaxLength(8)),
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('note').setLabel('Заметка')
+            .setStyle(TextInputStyle.Short).setValue(t.note || '').setRequired(false).setMaxLength(100)),
+        ));
+      }
+      if (cid.startsWith('trk_base_modal:')) {
+        const t = tracker.setBase(cid.split(':')[1], i.fields.getTextInputValue('base'), i.fields.getTextInputValue('note'));
+        return respond(t ? targetCard(t) : trackerView('Игрок уже удалён'));
+      }
+      if (cid === 'trk_srv') {
+        return i.showModal(new ModalBuilder().setCustomId('trk_srv_modal').setTitle('🌍 Сервер для слежки').addComponents(
+          new ActionRowBuilder().addComponents(new TextInputBuilder().setCustomId('q')
+            .setLabel('Название сервера или ссылка BattleMetrics').setStyle(TextInputStyle.Short)
+            .setPlaceholder('Rustoria EU Main  или  battlemetrics.com/servers/rust/123').setRequired(true).setMaxLength(200)),
+        ));
+      }
+      if (cid === 'trk_srv_modal') {
+        const q = i.fields.getTextInputValue('q');
+        if (i.isFromMessage()) await i.deferUpdate(); else await i.deferReply({ flags: MessageFlags.Ephemeral });
+        const ref = tracker.parseServerRef(q);
+        if (ref) {
+          const srv = await tracker.getServer(ref);
+          tracker.setServerFor(rustKey(), srv.id, srv.name);
+          return i.editReply(trackerView(`🌍 Новые цели будут на **${srv.name}** (${srv.players}/${srv.maxPlayers})`));
+        }
+        const list = await tracker.searchServers(q);
+        if (!list.length) return i.editReply(trackerView(`⚠️ На BattleMetrics не нашёл «${q}». Попробуй короче или вставь ссылку.`));
+        const view = trackerView(`🔎 Найдено ${list.length} — выбери сервер ниже`);
+        view.components.push(new ActionRowBuilder().addComponents(new StringSelectMenuBuilder()
+          .setCustomId('trk_srv_pick').setPlaceholder('🌍 Выбери сервер…')
+          .addOptions(list.slice(0, 25).map((s) => ({
+            label: s.name.slice(0, 100), value: `${s.id}`,
+            description: `${s.players}/${s.maxPlayers} онлайн${s.country ? ` • ${s.country}` : ''}${s.status && s.status !== 'online' ? ` • ${s.status}` : ''}`.slice(0, 100),
+          })))));
+        return i.editReply(view);
+      }
+      if (cid === 'trk_srv_pick') {
+        const opt = i.component?.options?.find((o) => o.value === i.values[0]);
+        tracker.setServerFor(rustKey(), i.values[0], opt?.label);
+        return i.update(trackerView(`🌍 Новые цели будут на **${tracker.serverName(i.values[0])}**`));
+      }
+    }
+
     if (cid === 'm:refresh') {
       await refreshStatus();
       return i.reply(eph(card({ desc: '🔄 Меню обновлено', color: COLOR.ok })));
@@ -1290,6 +1521,7 @@ function connectRust() {
       }
       everConnected = true;
       if (!menuMsgId) await postMenu().catch((e) => log('Меню:', e.message));
+      autoDetectBm();
       if (warnedBadToken || outageAnnounced) log('Связь с Rust+ восстановлена');
       failStreak = 0; warnedBadToken = false; outageAnnounced = false;
     } catch (e) {
@@ -1357,6 +1589,8 @@ discord.once('clientReady', async () => {
     updateMenu();
   });
   refreshStatus();
+  setInterval(trackerTick, 60000);
+  setTimeout(trackerTick, 5000);
   if (!S().accessRole) log('ℹ️ Роль доступа не выбрана — выбери её в Discord: меню → ⚙️ Настройки');
   accounts.load();
   for (const a of accounts.all()) runFcm(a);
