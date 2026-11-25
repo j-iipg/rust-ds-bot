@@ -1006,6 +1006,47 @@ async function registerSlash() {
   }
 }
 
+// ---------- статус связи: одно сообщение на проблему + кнопка «Понял» ----------
+const STATUS_FILE = path.join(store.DATA, 'status.json');
+let statusState = { ack: false, incidentId: null, ...store.read(STATUS_FILE, {}) };
+const saveStatus = () => store.write(STATUS_FILE, statusState);
+const isTimeout = (e) => /timeout|timed out/i.test(String(e?.message || e?.error || e));
+
+// о временных проблемах пишем, только если связь не вернулась за 90 сек
+let statusTimer = null, pendingStatus = null;
+function setStatusLater(kind, text, color) {
+  pendingStatus = [kind, text, color];
+  if (statusTimer) return;
+  statusTimer = setTimeout(() => {
+    statusTimer = null;
+    if (!rust && pendingStatus) setStatus(...pendingStatus);
+  }, 90000);
+}
+
+async function setStatus(kind, text, color) {
+  if (!channel) return;
+  if (kind === 'ok') {
+    clearTimeout(statusTimer); statusTimer = null; pendingStatus = null;
+    // связь вернулась: правим сообщение о проблеме (без нового сообщения)
+    const id = statusState.incidentId;
+    statusState.incidentId = null; statusState.ack = false; saveStatus();
+    if (id) {
+      try { await (await channel.messages.fetch(id)).edit({ embeds: [card({ desc: text, color: COLOR.ok, author: 'СТАТУС' })], components: [] }); return; } catch {}
+    }
+    if (!everConnected) toDiscord(text, COLOR.ok); // первое подключение после запуска
+    return;
+  }
+  if (statusState.ack) return; // нажали «Понял» — молчим, пока не восстановится
+  const payload = {
+    embeds: [card({ desc: `${text}\n\n_Нажми «Понял», и я не буду писать о проблемах со связью, пока она не вернётся._`, color: color || COLOR.warn, author: 'СТАТУС' })],
+    components: [new ActionRowBuilder().addComponents(btn('st_ack', 'Понял', '👍', ButtonStyle.Secondary))],
+  };
+  if (statusState.incidentId) {
+    try { await (await channel.messages.fetch(statusState.incidentId)).edit(payload); return; } catch {}
+  }
+  try { statusState.incidentId = (await channel.send(payload)).id; saveStatus(); } catch (e) { log('Статус:', e.message); }
+}
+
 // ---------- главное меню (дашборд с кнопками) ----------
 const MENU_FILE = path.join(process.cwd(), 'data', 'menu.json');
 let menuMsgId = null;
@@ -1254,13 +1295,18 @@ discord.on('interactionCreate', async (i) => {
   const who = i.member?.displayName || i.user.username;
   if (!i.isRepliable()) return;
   // сборы и слэш-команды — для всех (права на изменение сбора проверяются отдельно)
-  const isPublic = i.isChatInputCommand() || /^ev_/.test(i.customId || '') || (S().publicButtons && PUBLIC_IDS.test(i.customId || ''));
+  const isPublic = i.customId === 'st_ack' || i.isChatInputCommand() || /^ev_/.test(i.customId || '') || (S().publicButtons && PUBLIC_IDS.test(i.customId || ''));
   if (!isPublic && !hasAccess(i.member)) return i.reply(eph(card({ desc: NO_ACCESS(), color: COLOR.warn }))).catch(() => {});
   if (!i.isModalSubmit() && tooFast(i.user.id, 800)) {
     return i.reply(eph(card({ desc: '⏳ Не так быстро', color: COLOR.muted }))).catch(() => {});
   }
   try {
     const cid = i.customId || '';
+    if (cid === 'st_ack') {
+      statusState.ack = true; statusState.incidentId = null; saveStatus();
+      log(`Статус: ${who} нажал «Понял»`);
+      return i.update({ embeds: [card({ desc: `👍 **${who}** понял — молчу о проблемах со связью, пока она не вернётся. Состояние видно в 🏠 меню.`, color: COLOR.muted, author: 'СТАТУС' })], components: [] });
+    }
     // --- слэш-команды ---
     if (i.isChatInputCommand()) {
       if (i.commandName === 'vipe') return i.showModal(eventModal('ev_modal', '📅 Новый сбор', evDraft.get(i.user.id)));
@@ -1715,7 +1761,7 @@ let everConnected = false;
 let failStreak = 0;        // сколько раз подряд сервер не отдал данные
 let warnedBadToken = false; // уже предупредили в Discord
 let outageAnnounced = false;
-const reconnectDelay = () => Math.min(20000 * 2 ** failStreak, 10 * 60 * 1000); // 20с, 40с, 80с... до 10 мин
+const reconnectDelay = () => Math.min(20000 * 2 ** failStreak, 5 * 60 * 1000); // 20с, 40с, 80с... до 5 мин
 let mapCache = null; // { sid, map } — картинка карты не меняется до вайпа
 
 function switchServer(body, who) {
@@ -1767,7 +1813,7 @@ function connectRust() {
     rust = r;
     log('Rust+ подключён');
     try {
-      const info = await r.sendRequestAsync({ getInfo: {} });
+      const info = await r.sendRequestAsync({ getInfo: {} }, 30000); // большие серверы отвечают медленно
       mapSize = info.info.mapSize;
       serverInfo = info.info;
       // вайп: время вайпа поменялось → старые устройства больше не существуют
@@ -1779,14 +1825,12 @@ function connectRust() {
         toDiscord(`🧹 На сервере был **вайп** — список устройств очищен${n ? ` (было ${n})` : ''}. Привяжи свитчи заново: E → Pair.`, COLOR.warn);
       }
       if (wipe && server.wipeTime !== wipe) { server.wipeTime = wipe; store.write(SERVER_FILE, server, { secret: true }); }
-      const ti = await r.sendRequestAsync({ getTeamInfo: {} });
+      const ti = await r.sendRequestAsync({ getTeamInfo: {} }, 30000);
       processTeam(ti.teamInfo, true);
       await pollEvents();
       await subscribeAll();
       updatePanel();
-      if (!everConnected || warnedBadToken || outageAnnounced) {
-        toDiscord(`✅ Подключился к **${info.info.name}** — онлайн ${info.info.players}/${info.info.maxPlayers}, в пачке ${team.size} чел., устройств ${dev.all().length}`, 0x2ecc71);
-      }
+      await setStatus('ok', `✅ Подключился к **${info.info.name}** — онлайн ${info.info.players}/${info.info.maxPlayers}, в пачке ${team.size} чел., устройств ${dev.all().length}`);
       everConnected = true;
       if (!menuMsgId) await postMenu().catch((e) => log('Меню:', e.message));
       autoDetectBm();
@@ -1795,11 +1839,14 @@ function connectRust() {
     } catch (e) {
       failStreak++;
       log(`Сервер не отдал данные (попытка ${failStreak}):`, errText(e));
-      if (!warnedBadToken) {
+      if (isTimeout(e)) {
+        // не вайп: сервер (или Rust+ Facepunch) просто не ответил вовремя
+        setStatusLater('slow', '🐢 **Сервер Rust+ не отвечает** — похоже, перегружен. Тихо переподключаюсь, ничего делать не нужно.', COLOR.muted);
+      } else {
         warnedBadToken = true;
-        toDiscord('⚠️ **Сервер не принимает токен бота** — скорее всего был **вайп**.\n' +
+        setStatus('token', '⚠️ **Сервер не принимает токен бота** — скорее всего был **вайп**.\n' +
           'Зайди на сервер → Esc → Rust+ → **Pair with server** (можно с любого привязанного аккаунта) — бот сам подхватит.\n' +
-          `Пока буду тихо пробовать переподключаться (ошибка: \`${errText(e)}\`).`, 0xe67e22);
+          `Ошибка: \`${errText(e)}\``, COLOR.warn);
       }
       rust = null;
       try { r.disconnect(); } catch {}
@@ -1824,9 +1871,9 @@ function connectRust() {
   currentClient = r;
   r.on('disconnected', () => {
     if (r.switching) return; // переключаемся на другой сервер — переподключение сделает switchServer
-    if (rust === r && !outageAnnounced && !warnedBadToken) {
+    if (rust === r) {
       outageAnnounced = true;
-      toDiscord('🔌 Отключился от Rust+, переподключаюсь...', 0x95a5a6);
+      setStatusLater('down', '🔌 **Отключился от Rust+** — переподключаюсь сам.', COLOR.muted);
     }
     const delay = reconnectDelay();
     log(`Rust+ отключён, переподключение через ${Math.round(delay / 1000)} сек`);
